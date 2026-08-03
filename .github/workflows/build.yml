@@ -1,0 +1,97 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download verified FanControl V272 references
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "FanControl_272_net_10_0.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "FanControl_272_net_10_0"
+          $uri = "https://github.com/Rem0o/FanControl.Releases/releases/download/V272/FanControl_272_net_10_0.zip"
+          $expectedHash = "5f84c3514b213ea040051c595f1915d9c75e3b5f1c9d7b9b39353f6bbbcd2b80"
+
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+              throw "FanControl archive checksum mismatch: $actualHash"
+          }
+
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
+          $pluginApi = Get-ChildItem -LiteralPath $extractDir -Recurse -File -Filter "FanControl.Plugins.dll" |
+              Select-Object -First 1
+          if ($null -eq $pluginApi) {
+              throw "FanControl.Plugins.dll was not found in the verified archive."
+          }
+          "FANCONTROL_DIR=$($pluginApi.Directory.FullName)" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build plugin
+        shell: pwsh
+        run: |
+          dotnet build .\FanControl.MinisforumUM780XTX.csproj `
+              --configuration Release `
+              "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              -p:ContinuousIntegrationBuild=true
+
+      - name: Run hardware-free tests
+        shell: pwsh
+        run: |
+          dotnet run `
+              --project .\tests\FanControl.MinisforumUM780XTX.Tests.csproj `
+              --configuration Release `
+              "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              -p:ContinuousIntegrationBuild=true
+
+      - name: Package plugin
+        shell: pwsh
+        run: |
+          $assetDir = Join-Path $PWD "release-assets"
+          $stagingDir = Join-Path $env:RUNNER_TEMP "FanControl.MinisforumUM780XTX"
+          $sourceDll = Join-Path $PWD "bin\Release\net10.0-windows\FanControl.MinisforumUM780XTX.dll"
+          $archive = Join-Path $assetDir "FanControl.MinisforumUM780XTX.zip"
+
+          New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+          Copy-Item -LiteralPath $sourceDll -Destination $stagingDir
+          Compress-Archive -Path (Join-Path $stagingDir "FanControl.MinisforumUM780XTX.dll") `
+              -DestinationPath $archive -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+              if ($zip.Entries.Count -ne 1 -or
+                  $zip.Entries[0].FullName -ne "FanControl.MinisforumUM780XTX.dll") {
+                  throw "Plugin archive must contain exactly one root-level DLL."
+              }
+          }
+          finally {
+              $zip.Dispose()
+          }
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: FanControl.MinisforumUM780XTX
+          path: release-assets/FanControl.MinisforumUM780XTX.zip
+          if-no-files-found: error

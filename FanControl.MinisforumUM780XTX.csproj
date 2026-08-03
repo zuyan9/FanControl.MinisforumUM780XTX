@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>FanControl.MinisforumUM780XTX</AssemblyName>
+    <RootNamespace>FanControl.MinisforumUM780XTX</RootNamespace>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <FanControlDir Condition="'$(FanControlDir)' == ''">C:\Program Files (x86)\FanControl</FanControlDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
+    <Reference Include="FanControl.Plugins">
+      <HintPath>$(FanControlDir)\FanControl.Plugins.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateFanControlReferences" BeforeTargets="ResolveReferences">
+    <Error
+      Condition="!Exists('$(FanControlDir)\FanControl.Plugins.dll')"
+      Text="FanControl.Plugins.dll was not found. Set FanControlDir to the FanControl installation directory." />
+  </Target>
+</Project>
+
