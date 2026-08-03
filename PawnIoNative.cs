@@ -1,13 +1,9 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
-using Microsoft.Win32;
 
 namespace FanControl.MinisforumUM780XTX;
 
 internal readonly record struct EcWrite(ushort Address, byte Value);
-
-internal readonly record struct EcExpectation(ushort Address, byte Value);
 
 internal interface IF7bsdTransport : IDisposable
 {
@@ -15,7 +11,7 @@ internal interface IF7bsdTransport : IDisposable
 
     byte[] Read(ushort[] addresses);
 
-    void Write(EcWrite[] writes, EcExpectation[]? expectations = null);
+    void Write(EcWrite[] writes);
 }
 
 internal sealed class PawnIoTransport : IF7bsdTransport
@@ -26,7 +22,6 @@ internal sealed class PawnIoTransport : IF7bsdTransport
 
     internal PawnIoTransport()
     {
-        VerifyPawnIoDriver();
         string pawnIoPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
             "PawnIO",
@@ -75,12 +70,10 @@ internal sealed class PawnIoTransport : IF7bsdTransport
         });
     }
 
-    public void Write(EcWrite[] writes, EcExpectation[]? expectations = null)
+    public void Write(EcWrite[] writes)
     {
         ArgumentNullException.ThrowIfNull(writes);
-        expectations ??= [];
         F7bsdProfile.AssertWritesAllowed(writes);
-        F7bsdProfile.AssertReadsAllowed(expectations.Select(item => item.Address));
         RunIsa(() =>
         {
             SelectSlot();
@@ -88,16 +81,6 @@ internal sealed class PawnIoTransport : IF7bsdTransport
             {
                 AssertPnpIdentity();
                 AssertControllerProfile();
-                foreach (EcExpectation expectation in expectations)
-                {
-                    byte actual = ReadByte(expectation.Address);
-                    if (actual != expectation.Value)
-                    {
-                        throw new IOException(
-                            $"EC write precondition failed at 0x{expectation.Address:X4}: " +
-                            $"expected 0x{expectation.Value:X2}, read 0x{actual:X2}.");
-                    }
-                }
                 foreach (EcWrite write in writes)
                 {
                     WriteByte(write.Address, write.Value);
@@ -261,54 +244,12 @@ internal sealed class PawnIoTransport : IF7bsdTransport
         Assembly assembly = AppDomain.CurrentDomain.GetAssemblies()
             .FirstOrDefault(item => item.GetName().Name == "LibreHardwareMonitorLib") ??
             Assembly.LoadFrom(path);
-        VerifySha256(
-            assembly.Location,
-            F7bsdProfile.LibreHardwareMonitorSha256,
-            "LibreHardwareMonitor assembly");
         using Stream stream = assembly.GetManifestResourceStream(
             F7bsdProfile.LpcResourceName) ?? throw new InvalidOperationException(
                 $"PawnIO resource was not found: {F7bsdProfile.LpcResourceName}");
         byte[] module = new byte[checked((int)stream.Length)];
         stream.ReadExactly(module);
-        string moduleHash = Convert.ToHexString(SHA256.HashData(module));
-        if (!string.Equals(
-            moduleHash,
-            F7bsdProfile.LpcModuleSha256,
-            StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                "The embedded PawnIO LPC module does not match the reviewed build.");
-        }
         return module;
-    }
-
-    private static void VerifySha256(string path, string expected, string description)
-    {
-        using FileStream stream = File.OpenRead(path);
-        string actual = Convert.ToHexString(SHA256.HashData(stream));
-        if (!string.Equals(actual, expected, StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                $"The {description} does not match the reviewed build.");
-        }
-    }
-
-    private static void VerifyPawnIoDriver()
-    {
-        const string serviceKey =
-            @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\PawnIO";
-        string imagePath = Convert.ToString(
-            Registry.GetValue(serviceKey, "ImagePath", null))?.Trim().Trim('"') ??
-            throw new InvalidOperationException("The PawnIO driver service is not installed.");
-        const string systemRootPrefix = @"\SystemRoot\";
-        string resolved = imagePath.StartsWith(systemRootPrefix, StringComparison.OrdinalIgnoreCase)
-            ? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                imagePath[systemRootPrefix.Length..])
-            : imagePath.StartsWith(@"\??\", StringComparison.Ordinal)
-                ? imagePath[4..]
-                : imagePath;
-        VerifySha256(resolved, F7bsdProfile.PawnIoDriverSha256, "PawnIO driver");
     }
 }
 
@@ -346,7 +287,6 @@ internal sealed class PawnIoNative : IDisposable
 
     internal PawnIoNative(string libraryPath)
     {
-        VerifyLibrary(libraryPath);
         library = NativeLibrary.Load(libraryPath);
         try
         {
@@ -427,20 +367,6 @@ internal sealed class PawnIoNative : IDisposable
 
     private T Export<T>(string name) where T : Delegate =>
         Marshal.GetDelegateForFunctionPointer<T>(NativeLibrary.GetExport(library, name));
-
-    private static void VerifyLibrary(string path)
-    {
-        using FileStream stream = File.OpenRead(path);
-        string actual = Convert.ToHexString(SHA256.HashData(stream));
-        if (!string.Equals(
-            actual,
-            F7bsdProfile.PawnIoLibrarySha256,
-            StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                "PawnIOLib.dll does not match the reviewed 2.2.0 build.");
-        }
-    }
 
     private static void Check(int result, string operation)
     {

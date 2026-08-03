@@ -6,8 +6,8 @@ machine's IT5571 embedded controller (EC) and exposes:
 
 - CPU and system fan RPM;
 - CPU and system EC temperatures;
-- a CPU fan control backed by the native seven-row curve; and
-- a system fan control backed by the firmware's three native states.
+- a CPU closed-loop target backed by a flat native seven-row curve; and
+- a system closed-loop target backed by the EC's fixed-target selector.
 
 The plugin is deliberately specific to the hardware and firmware combination
 on which the register map was verified. It does not scan EC memory or attempt
@@ -23,8 +23,6 @@ Initialization succeeds only when every gate matches:
 | Baseboard | `F7BSD` revision `1.1` |
 | BIOS / SMBIOS EC | `1.06` / `0.8` |
 | Live controller profile | `55 71 02 43 14 7f` |
-| CPU profile | firmware baseline `0`, `b1`, or `b2` |
-| System thresholds | stock `(25,83,100)` |
 | CPU critical row | `(51,100,93,0)` |
 
 The current implementation targets FanControl V272 on Windows 11 x64. Other
@@ -33,47 +31,37 @@ before any fan-policy byte is written.
 
 ## Control behavior
 
+Both controls expose the complete verified EC target range to FanControl. A
+FanControl request from 0–100% maps linearly to EC code `0–51`, nominally
+0–5100 RPM in 100-RPM steps. These are requested closed-loop targets, not
+guaranteed physical speeds: the EC still measures the tachometer and drives the
+fan. FanControl should own calibration, curves, hysteresis, mixing, minimum
+running speed, and start/stop behavior.
+
+The plugin intentionally adds no thermal floor and does not quantize requests
+into preset modes. In particular, code `0` is exposed and may stop a fan.
+
 ### CPU fan
 
-FanControl's 0–100% request maps to a 0–5100 RPM requested target, but the EC
-curve compiler always applies this independent thermal floor:
-
-| CPU temperature | Minimum target |
-|---|---:|
-| through 74 C | 1000 RPM |
-| 82 C | 3000 RPM |
-| 88 C | 4000 RPM |
-| 93 C | 5100 RPM |
-| 94 C and above | firmware critical row, 5100 RPM |
-
-Consequently, 0% does not stop the CPU fan. The plugin changes only the seven
-normal base/slope pairs. It computes a byte-at-a-time transition whose every
-intermediate curve stays at or above the lower of the old and new targets,
-verifies every write and the final aggregate, and never writes the critical
-row. A transition may conservatively evaluate to code 52 for one step to avoid
-an undershoot; normal and final curves remain capped at code 51.
+The EC normally selects a target from seven temperature rows. For raw control,
+the plugin sets all seven normal rows to the requested code with zero slope,
+making their target flat across temperature. It never writes the independent
+CPU critical row `(51,100,93,0)`, which remains firmware-owned. The 14 writable
+normal-row bytes are captured at initialization and restored when control ends;
+the plugin does not require a hard-coded stock CPU curve.
 
 ### System fan
 
-The system fan has no crash-safe arbitrary-RPM handoff on Windows. This first
-version therefore quantizes FanControl's request to the closest native state:
+On the first control request, the plugin engages the verified `0xff`
+fixed-target selector and writes the requested code directly to the system-fan
+target. Later requests update that target without changing the firmware's
+temperature thresholds. FanControl calls `Set` on every update, so each call
+also re-engages the selector if necessary and reasserts the raw target; the
+plugin does not run a separate fan-policy maintenance loop.
 
-| Displayed control | Normal-temperature target | Full-speed transition |
-|---:|---:|---:|
-| 0% | off | 70 C |
-| 39.2% | about 2000 RPM | 70 C |
-| 100% | about 5100 RPM | already full |
-
-In practice, requests up to roughly 18% select off, 19–69% select quiet, and
-70–100% select full. The off and quiet policies retain a firmware-owned 5100
-RPM branch from 70 C, even if FanControl exits unexpectedly.
-
-If the system-fan temperature byte is invalid, the plugin forces and retains
-the full-speed state instead of restoring a policy that could stop the fan.
-
-The verified `0xff` fixed-target sentinel is intentionally not used: it would
-disable firmware target selection and cannot be cleared by an in-process plugin
-after a forced FanControl termination.
+This is the complete useful system-fan command surface discovered for this EC.
+The plugin does not write PWM/DCR output: those bytes are the EC controller's
+continuously updated actuator output, not a stable command interface.
 
 ## Install
 
@@ -105,16 +93,22 @@ dotnet build -c Release `
 
 ## Recovery and safety
 
-Disabling a control restores that fan's captured firmware baseline when the
-live EC identity, override bytes, and sensor state remain valid. A normal plugin
-refresh or FanControl exit attempts to restore both. If safe restoration cannot
-be proved, the plugin reports the failure and leaves the safer active policy in
-place. A forced process termination can leave the CPU curve and/or system mode
-in volatile EC RAM; restart Windows before reopening FanControl so firmware
-reloads its configured baseline.
+Disabling a control invokes its FanControl `Reset` callback. A normal plugin
+refresh or orderly FanControl exit also invokes reset/close handling. The plugin
+uses those callbacks to restore the captured CPU table and return the system
+fan from fixed-target mode to firmware control. System release first seeds a
+full target, clears the fixed-target sentinel, and verifies that the live
+temperature selector owns the target again.
 
-The plugin never writes fan PWM/DCR registers, either temperature override,
-the CPU critical row, or firmware. PawnIO access uses the global ISA mutex,
-the validated slot 0 / `0x2e` transport, a fixed address allowlist, live profile
-revalidation, exact reviewed PawnIO/LibreHardwareMonitor hashes, selector
-parking, immediate read-back, and aggregate verification.
+A forced process termination cannot run those callbacks. It may therefore
+leave the last CPU target or system fixed target active in volatile EC RAM,
+including a zero target. If FanControl is killed, Windows crashes, or recovery
+cannot be confirmed, reboot before reopening FanControl so the firmware reloads
+its baseline.
+
+The plugin remains exact-hardware-only: it verifies machine and live-controller
+identity, serializes ISA access with the global mutex, parks the selector, uses
+a fixed address allowlist, and verifies writes by reading them back. It never
+writes fan PWM/DCR registers, the CPU temperature-override byte, the CPU
+critical row, or firmware. It writes the system temperature-override byte only
+as `0xff` to engage raw fixed-target control and `0` to release it.

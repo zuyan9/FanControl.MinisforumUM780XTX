@@ -12,28 +12,46 @@ internal static class Program
         0,
         8);
 
+    private static readonly ushort[] CpuBaseAddresses =
+        Enumerable.Range(0, 7)
+            .Select(row => (ushort)(0x0310 + (row * 3)))
+            .ToArray();
+
+    private static readonly ushort[] CpuSlopeAddresses =
+        Enumerable.Range(0x08b0, 7)
+            .Select(address => (ushort)address)
+            .ToArray();
+
+    private static readonly ushort[] CpuRestoreAddresses =
+        [.. CpuBaseAddresses, .. CpuSlopeAddresses];
+
+    private static readonly ushort[] CpuCriticalAddresses =
+        [0x0325, 0x0326, 0x0327, 0x08b7];
+
     private static int Main()
     {
         (string Name, Action Body)[] tests =
         [
-            ("percentage validation and system quantization", PercentageAndQuantization),
-            ("system policy write order", SystemPolicyWriteOrder),
-            ("CPU compiler exhaustive default", () => ExhaustiveCpuCompiler(0)),
-            ("CPU compiler exhaustive B1", () => ExhaustiveCpuCompiler(0xb1)),
-            ("CPU compiler exhaustive B2", () => ExhaustiveCpuCompiler(0xb2)),
-            ("CPU bytewise transitions stay safe", CpuTransitionsStaySafe),
-            ("CPU critical addresses excluded", CpuCriticalAddressesExcluded),
+            ("linear percentage conversion", LinearPercentageConversion),
+            ("raw profile write generation", RawProfileWriteGeneration),
+            ("thin write allowlist", ThinWriteAllowlist),
             ("tach low-high-low decoder", TachLowHighLowDecoder),
             ("exact host identity gate", ExactHostIdentityGate),
-            ("initialization gates without writes", InitializationGatesWithoutWrites),
-            ("backend CPU lifecycle", BackendCpuLifecycle),
-            ("CPU transition snapshot preconditions", CpuTransitionSnapshotPreconditions),
-            ("backend CPU failure restoration", BackendCpuFailureRestoration),
-            ("active policy reload recovery", ActivePolicyReloadRecovery),
-            ("system policies and thermal seeds", SystemPoliciesAndThermalSeeds),
-            ("system failure restoration", SystemFailureRestoration),
-            ("backend close restoration continuation", BackendCloseRestorationContinuation),
-            ("plugin sensor and control lifecycle", PluginSensorAndControlLifecycle),
+            ("initialization identity and critical-row gates", InitializationIdentityAndCriticalGates),
+            ("initialization accepts arbitrary controller policy state", InitializationAcceptsArbitraryPolicyState),
+            ("external system ownership is refused on Set", ExternalSystemOwnershipIsRefused),
+            ("raw CPU target lifecycle", RawCpuTargetLifecycle),
+            ("raw CPU failure restores baseline", RawCpuFailureRestoresBaseline),
+            ("CPU restore ignores mutable external configuration", CpuRestoreIgnoresMutableConfiguration),
+            ("raw system ownership lifecycle", RawSystemOwnershipLifecycle),
+            ("raw system ownership failures are recoverable", RawSystemOwnershipFailureRecovery),
+            ("raw system release can be retried", RawSystemReleaseRetry),
+            ("raw targets are not thermally promoted", RawTargetsAreNotThermallyPromoted),
+            ("periodic Set reasserts raw targets", PeriodicSetReassertsRawTargets),
+            ("telemetry remains passive during system control", TelemetryWhileSystemOwned),
+            ("close restores both controls", CloseRestoresBothControls),
+            ("close continues restoration after failure", CloseContinuesAfterRestoreFailure),
+            ("plugin sensor and raw control lifecycle", PluginSensorAndRawControlLifecycle),
             ("plugin telemetry error clears stale values", PluginTelemetryErrorClearsStaleValues),
             ("plugin initialization failure cleanup", PluginInitializationFailureCleanup),
         ];
@@ -57,7 +75,7 @@ internal static class Program
         return failures == 0 ? 0 : 1;
     }
 
-    private static void PercentageAndQuantization()
+    private static void LinearPercentageConversion()
     {
         Equal((byte)0, F7bsdProfile.ToCode(0f));
         Equal((byte)1, F7bsdProfile.ToCode(1f));
@@ -69,234 +87,77 @@ internal static class Program
         Equal(26 * 100f / 51f, F7bsdProfile.ToPercentage(26));
         Equal(100f, F7bsdProfile.ToPercentage(51));
 
+        for (byte code = 0; code <= 51; code++)
+        {
+            Equal(code, F7bsdProfile.ToCode(F7bsdProfile.ToPercentage(code)));
+        }
+
         Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.ToCode(-0.01f));
         Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.ToCode(100.01f));
         Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.ToCode(float.NaN));
-        Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.ToCode(float.PositiveInfinity));
+        Throws<ArgumentOutOfRangeException>(() =>
+            F7bsdProfile.ToCode(float.PositiveInfinity));
         Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.ToPercentage(52));
-
-        for (byte code = 0; code <= F7bsdProfile.MaximumCode; code++)
-        {
-            SystemFanMode expected = code switch
-            {
-                < 10 => SystemFanMode.Off,
-                < 36 => SystemFanMode.Quiet,
-                _ => SystemFanMode.Full,
-            };
-            Equal(expected, F7bsdProfile.SystemMode(code));
-        }
-        Equal((byte)0, F7bsdProfile.SystemModeCode(SystemFanMode.Off));
-        Equal((byte)20, F7bsdProfile.SystemModeCode(SystemFanMode.Quiet));
-        Equal((byte)51, F7bsdProfile.SystemModeCode(SystemFanMode.Full));
-        Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.SystemMode(52));
     }
 
-    private static void SystemPolicyWriteOrder()
+    private static void ThinWriteAllowlist()
     {
-        SequenceEqual(
-            [
-                new EcWrite(0x0334, 70),
-                new EcWrite(0x0337, 100),
-                new EcWrite(0x0331, 70),
-            ],
-            F7bsdProfile.SystemWrites(SystemFanMode.Off));
-        SequenceEqual(
-            [
-                new EcWrite(0x0334, 70),
-                new EcWrite(0x0337, 100),
-                new EcWrite(0x0331, 0),
-            ],
-            F7bsdProfile.SystemWrites(SystemFanMode.Quiet));
-        SequenceEqual(
-            [
-                new EcWrite(0x0334, 0),
-                new EcWrite(0x0337, 100),
-                new EcWrite(0x0331, 0),
-            ],
-            F7bsdProfile.SystemWrites(SystemFanMode.Full));
-        SequenceEqual(
-            [
-                new EcWrite(0x0334, 83),
-                new EcWrite(0x0337, 100),
-                new EcWrite(0x0331, 25),
-            ],
-            F7bsdProfile.SystemRestoreWrites([25, 83, 100]));
+        EcWrite[] allowed = CpuBaseAddresses
+            .Select(address => new EcWrite(address, 51))
+            .Append(new EcWrite(CpuBaseAddresses[0], 0xff))
+            .Concat(CpuSlopeAddresses.Select(address => new EcWrite(address, 0)))
+            .Append(new EcWrite(0x0885, 0))
+            .Append(new EcWrite(0x088b, 0xff))
+            .Append(new EcWrite(0x088b, 0))
+            .ToArray();
+        F7bsdProfile.AssertWritesAllowed(allowed);
 
-        foreach (SystemFanMode mode in Enum.GetValues<SystemFanMode>())
-        {
-            EcWrite[] writes = F7bsdProfile.SystemWrites(mode);
-            Equal(3, writes.Length);
-            F7bsdProfile.AssertWritesAllowed(writes);
-        }
-    }
-
-    private static void ExhaustiveCpuCompiler(byte selector)
-    {
-        FakeTransport transport = new(selector);
-        CpuConfiguration configuration = F7bsdProfile.ValidateCpuConfiguration(
-            transport.Read(F7bsdProfile.CpuConfigurationAddresses));
-        Equal(selector, configuration.Selector);
-
-        for (byte requestedCode = 0;
-            requestedCode <= F7bsdProfile.MaximumCode;
-            requestedCode++)
-        {
-            CpuEncoding[] encodings = F7bsdProfile.CompileCpuCurve(
-                requestedCode,
-                configuration.Bands);
-            Equal(7, encodings.Length);
-
-            foreach (bool cooling in new[] { false, true })
-            {
-                int previous = -1;
-                for (int temperature = 0;
-                    temperature < F7bsdProfile.CpuCriticalTemperatureC;
-                    temperature++)
-                {
-                    int target = F7bsdProfile.CpuTarget(
-                        encodings,
-                        configuration.Bands,
-                        temperature,
-                        cooling);
-                    True(target >= requestedCode);
-                    True(target >= F7bsdProfile.SafetyCode(temperature));
-                    True(target <= F7bsdProfile.MaximumCode);
-                    True(target >= previous);
-                    previous = target;
-                }
-
-                Equal(
-                    (int)F7bsdProfile.MaximumCode,
-                    F7bsdProfile.CpuTarget(
-                        encodings,
-                        configuration.Bands,
-                        F7bsdProfile.CpuCriticalTemperatureC,
-                        cooling));
-            }
-
-            EcWrite[] writes = F7bsdProfile.CpuWrites(
-                requestedCode,
-                configuration.Bands);
-            Equal(14, writes.Length);
-            Equal(14, writes.Select(write => write.Address).Distinct().Count());
-            SequenceEqual(F7bsdProfile.CpuBaseAddresses, writes.Take(7).Select(w => w.Address));
-            SequenceEqual(F7bsdProfile.CpuSlopeAddresses, writes.Skip(7).Select(w => w.Address));
-            F7bsdProfile.AssertWritesAllowed(writes);
-        }
-    }
-
-    private static void CpuTransitionsStaySafe()
-    {
-        foreach (byte selector in new byte[] { 0, 0xb1, 0xb2 })
-        {
-            FakeTransport transport = new(selector);
-            CpuConfiguration configuration = F7bsdProfile.ValidateCpuConfiguration(
-                transport.Read(F7bsdProfile.CpuConfigurationAddresses));
-            byte[] baseline = F7bsdProfile.CpuRestoreAddresses
-                .Select(transport.ByteAt)
-                .ToArray();
-            byte[] low = F7bsdProfile.CpuBytes(
-                F7bsdProfile.CompileCpuCurve(0, configuration.Bands));
-            byte[] middle = F7bsdProfile.CpuBytes(
-                F7bsdProfile.CompileCpuCurve(28, configuration.Bands));
-            byte[] full = F7bsdProfile.CpuBytes(
-                F7bsdProfile.CompileCpuCurve(51, configuration.Bands));
-
-            foreach ((string Name, byte[] Start, byte[] End) in new[]
-            {
-                ("baseline-low", baseline, low),
-                ("baseline-middle", baseline, middle),
-                ("baseline-full", baseline, full),
-                ("low-baseline", low, baseline),
-                ("middle-baseline", middle, baseline),
-                ("full-baseline", full, baseline),
-                ("low-full", low, full),
-                ("full-low", full, low),
-                ("low-middle", low, middle),
-                ("middle-low", middle, low),
-            })
-            {
-                try
-                {
-                    AssertSafeCpuTransition(Start, End, configuration.Bands);
-                }
-                catch (Exception exception)
-                {
-                    throw new InvalidOperationException(
-                        $"Selector 0x{selector:X2}, transition {Name} failed.",
-                        exception);
-                }
-            }
-        }
-    }
-
-    private static void AssertSafeCpuTransition(
-        byte[] start,
-        byte[] end,
-        CpuBand[] bands)
-    {
-        byte[] current = (byte[])start.Clone();
-        CpuEncoding[] startEncodings = F7bsdProfile.DecodeCpuBytes(start);
-        CpuEncoding[] endEncodings = F7bsdProfile.DecodeCpuBytes(end);
-        EcWrite[] writes = F7bsdProfile.CpuTransitionWrites(start, end, bands);
-        F7bsdProfile.AssertWritesAllowed(writes);
-        False(writes.Any(write =>
-            F7bsdProfile.CpuCriticalAddresses.Contains(write.Address)));
-
-        foreach (EcWrite write in writes)
-        {
-            int baseIndex = Array.IndexOf(F7bsdProfile.CpuBaseAddresses, write.Address);
-            int slopeIndex = Array.IndexOf(F7bsdProfile.CpuSlopeAddresses, write.Address);
-            True(baseIndex >= 0 || slopeIndex >= 0);
-            current[baseIndex >= 0 ? baseIndex : 7 + slopeIndex] = write.Value;
-            CpuEncoding[] intermediate = F7bsdProfile.DecodeCpuBytes(current);
-            for (int row = 0; row < 7; row++)
-            {
-                for (int temperature = bands[row].Lower;
-                    temperature <= bands[row].Upper;
-                    temperature++)
-                {
-                    int delta = temperature - bands[row].Lower;
-                    int actual = EncodingTarget(intermediate[row], delta);
-                    int minimum = Math.Min(
-                        EncodingTarget(startEncodings[row], delta),
-                        EncodingTarget(endEncodings[row], delta));
-                    True(actual >= minimum);
-                    True(actual <= F7bsdProfile.CpuTransitionMaximumCode);
-                }
-            }
-        }
-        SequenceEqual(end, current);
-    }
-
-    private static int EncodingTarget(CpuEncoding encoding, int delta) =>
-        encoding.Base + ((encoding.Slope * delta) / 100);
-
-    private static void CpuCriticalAddressesExcluded()
-    {
-        foreach (byte selector in new byte[] { 0, 0xb1, 0xb2 })
-        {
-            FakeTransport transport = new(selector);
-            CpuConfiguration configuration = F7bsdProfile.ValidateCpuConfiguration(
-                transport.Read(F7bsdProfile.CpuConfigurationAddresses));
-            foreach (byte code in new byte[] { 0, 1, 20, 50, 51 })
-            {
-                ushort[] addresses = F7bsdProfile.CpuWrites(code, configuration.Bands)
-                    .Select(write => write.Address)
-                    .ToArray();
-                False(addresses.Intersect(F7bsdProfile.CpuCriticalAddresses).Any());
-            }
-        }
-
-        foreach (ushort criticalAddress in F7bsdProfile.CpuCriticalAddresses)
-        {
-            Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
-                [new EcWrite(criticalAddress, 0)]));
-        }
+        Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
+            [new EcWrite(0x0325, 51)]));
+        Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
+            [new EcWrite(0x0331, 0)]));
         Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
             [new EcWrite(0x1803, 20)]));
         Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
-            [new EcWrite(0x088a, 0)]));
+            [new EcWrite(0x1804, 20)]));
+        Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
+            [new EcWrite(0x088a, 0xff)]));
+        Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
+            [new EcWrite(0x0885, 52)]));
+        Throws<InvalidOperationException>(() => F7bsdProfile.AssertWritesAllowed(
+            [new EcWrite(0x088b, 1)]));
+    }
+
+    private static void RawProfileWriteGeneration()
+    {
+        foreach (byte code in Enumerable.Range(0, 52).Select(value => (byte)value))
+        {
+            EcWrite[] expected = CpuBaseAddresses
+                .Select(address => new EcWrite(address, code))
+                .Concat(CpuSlopeAddresses.Select(address => new EcWrite(address, 0)))
+                .ToArray();
+            SequenceEqual(expected, F7bsdProfile.CpuManualWrites(code));
+            SequenceEqual(
+                [.. Enumerable.Repeat(code, 7), .. new byte[7]],
+                F7bsdProfile.CpuManualBytes(code));
+        }
+
+        byte[] baseline =
+        [
+            0, 16, 18, 21, 28, 32, 33,
+            0, 10, 33, 58, 60, 16, 200,
+        ];
+        EcWrite[] expectedRestore = CpuSlopeAddresses
+            .Select((address, row) => new EcWrite(address, baseline[7 + row]))
+            .Concat(CpuBaseAddresses.Select(
+                (address, row) => new EcWrite(address, baseline[row])))
+            .ToArray();
+        SequenceEqual(expectedRestore, F7bsdProfile.CpuRestoreWrites(baseline));
+        False(expectedRestore.Any(write => CpuCriticalAddresses.Contains(write.Address)));
+
+        Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.CpuManualBytes(52));
+        Throws<ArgumentOutOfRangeException>(() => F7bsdProfile.CpuManualWrites(52));
+        Throws<ArgumentException>(() => F7bsdProfile.CpuRestoreWrites([0, 1]));
     }
 
     private static void TachLowHighLowDecoder()
@@ -313,20 +174,19 @@ internal static class Program
         Equal(56, telemetry.CpuTemperatureC);
         Equal(44, telemetry.SystemTemperatureC);
 
-        byte[] stopped = TelemetryBytes(0, 0, 40, 35);
-        True(F7bsdTelemetryDecoder.TryDecode(stopped, out F7bsdTelemetry? zero));
-        Equal(0, zero!.CpuFanRpm);
-        Equal(0, zero.SystemFanRpm);
+        True(F7bsdTelemetryDecoder.TryDecode(
+            TelemetryBytes(0, 0, 40, 35),
+            out F7bsdTelemetry? stopped));
+        Equal(0, stopped!.CpuFanRpm);
+        Equal(0, stopped.SystemFanRpm);
 
         byte[] tornCpu = (byte[])values.Clone();
         tornCpu[2]++;
-        False(F7bsdTelemetryDecoder.TryDecode(tornCpu, out F7bsdTelemetry? cpuResult));
-        Equal<F7bsdTelemetry?>(null, cpuResult);
+        False(F7bsdTelemetryDecoder.TryDecode(tornCpu, out _));
 
         byte[] tornSystem = (byte[])values.Clone();
         tornSystem[5]++;
-        False(F7bsdTelemetryDecoder.TryDecode(tornSystem, out F7bsdTelemetry? systemResult));
-        Equal<F7bsdTelemetry?>(null, systemResult);
+        False(F7bsdTelemetryDecoder.TryDecode(tornSystem, out _));
         Throws<ArgumentException>(() => F7bsdTelemetryDecoder.TryDecode([0, 1], out _));
     }
 
@@ -350,81 +210,30 @@ internal static class Program
         }
     }
 
-    private static void InitializationGatesWithoutWrites()
+    private static void InitializationIdentityAndCriticalGates()
     {
         FakeTransport good = new();
         PawnIoF7bsdBackend backend = CreateBackend(good);
         backend.Initialize();
         backend.Initialize();
-        Equal(5, good.ReadBatches.Count);
-        SequenceEqual(F7bsdProfile.ControllerProfileAddresses, good.ReadBatches[0]);
-        SequenceEqual(F7bsdProfile.CpuConfigurationAddresses, good.ReadBatches[1]);
-        SequenceEqual(F7bsdProfile.CpuRestoreAddresses, good.ReadBatches[2]);
-        SequenceEqual(F7bsdProfile.SystemThresholdAddresses, good.ReadBatches[3]);
-        SequenceEqual(F7bsdProfile.TelemetryAddresses, good.ReadBatches[4]);
         Equal(0, good.WriteBatches.Count);
         backend.Dispose();
         True(good.Disposed);
         Equal(0, good.WriteBatches.Count);
 
-        FakeTransport b2 = new(0xb2);
-        PawnIoF7bsdBackend b2Backend = CreateBackend(b2);
-        b2Backend.Initialize();
-        Equal(0, b2.WriteBatches.Count);
-        b2Backend.Dispose();
-
-        FakeTransport defaultProfile = new(0);
-        PawnIoF7bsdBackend defaultBackend = CreateBackend(defaultProfile);
-        defaultBackend.Initialize();
-        Equal(0, defaultProfile.WriteBatches.Count);
-        defaultBackend.Dispose();
-
-        FakeTransport wrongPnp = new();
-        wrongPnp.PnpIdentity = [0x55, 0x71, 0x03];
+        FakeTransport wrongPnp = new()
+        {
+            PnpIdentity = [0x55, 0x71, 0x03],
+        };
         AssertInitializationRejectedWithoutWrites(wrongPnp);
 
         FakeTransport wrongController = new();
         wrongController.SetByte(0x200d, 0x42);
         AssertInitializationRejectedWithoutWrites(wrongController);
 
-        FakeTransport wrongSelector = new();
-        wrongSelector.SetByte(0x032f, 0xb3);
-        AssertInitializationRejectedWithoutWrites(wrongSelector);
-
-        FakeTransport wrongBand = new();
-        wrongBand.SetByte(0x0311, 26);
-        AssertInitializationRejectedWithoutWrites(wrongBand);
-
         FakeTransport wrongCritical = new();
         wrongCritical.SetByte(0x0325, 50);
         AssertInitializationRejectedWithoutWrites(wrongCritical);
-
-        FakeTransport wrongCpuBaseline = new();
-        wrongCpuBaseline.SetByte(0x0310, 1);
-        AssertInitializationRejectedWithoutWrites(wrongCpuBaseline);
-
-        FakeTransport wrongThreshold = new();
-        wrongThreshold.SetByte(0x0331, 26);
-        AssertInitializationRejectedWithoutWrites(wrongThreshold);
-
-        FakeTransport cpuOverride = new();
-        cpuOverride.SetByte(0x088a, 1);
-        AssertInitializationRejectedWithoutWrites(cpuOverride);
-
-        FakeTransport systemOverride = new();
-        systemOverride.SetByte(0x088b, 0xff);
-        AssertInitializationRejectedWithoutWrites(systemOverride);
-
-        FakeTransport effectiveMismatch = new();
-        effectiveMismatch.SetByte(0x0889, 43);
-        AssertInitializationRejectedWithoutWrites(effectiveMismatch);
-
-        FakeTransport unstable = new() { UnstableTelemetryReadsRemaining = 16 };
-        PawnIoF7bsdBackend unstableBackend = CreateBackend(unstable);
-        Throws<IOException>(unstableBackend.Initialize);
-        Equal(0, unstable.WriteBatches.Count);
-        Equal(20, unstable.ReadBatches.Count);
-        True(unstable.Disposed);
 
         int factoryCalls = 0;
         FakeTransport unused = new();
@@ -441,385 +250,341 @@ internal static class Program
         False(unused.Disposed);
     }
 
-    private static void BackendCpuLifecycle()
+    private static void InitializationAcceptsArbitraryPolicyState()
     {
         FakeTransport transport = new();
+        byte[] arbitraryCpu =
+        [
+            7, 52, 50, 12, 0, 255, 23,
+            255, 1, 88, 0, 17, 244, 9,
+        ];
+        transport.SetCpuBytes(arbitraryCpu);
+        transport.SetByte(0x032f, 0xa5);
+        transport.SetByte(0x0311, 99);
+        transport.SetByte(0x0331, 1);
+        transport.SetByte(0x0334, 2);
+        transport.SetByte(0x0337, 3);
+        transport.SetByte(0x0309, 0);
+        transport.SetByte(0x0888, 201);
+        transport.SetByte(0x0305, 255);
+        transport.SetByte(0x0889, 7);
+        transport.SetByte(0x0884, 250);
+        transport.SetByte(0x0885, 249);
+        transport.SetByte(0x088a, 0x7e);
+
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+        Equal(0, transport.WriteBatches.Count);
+
+        // Initialization is not a policy audit. It captures the normal CPU
+        // table and leaves unrelated live firmware state alone.
+        SequenceEqual(arbitraryCpu, transport.CpuBytes());
+        backend.Dispose();
+        Equal(0, transport.WriteBatches.Count);
+        True(transport.Disposed);
+    }
+
+    private static void ExternalSystemOwnershipIsRefused()
+    {
+        FakeTransport transport = new();
+        transport.SetByte(0x088b, 0xff);
+        transport.SetByte(0x0889, 0xff);
         PawnIoF7bsdBackend backend = CreateBackend(transport);
         backend.Initialize();
 
-        byte returned = backend.Set(F7bsdFan.Cpu, 0);
-        Equal((byte)0, returned);
-        Equal<byte?>((byte)0, backend.CpuCode);
-        Equal(1, transport.WriteBatches.Count);
-        F7bsdProfile.AssertWritesAllowed(transport.WriteBatches[0]);
-        False(transport.WriteBatches[0].Any(write =>
-            F7bsdProfile.CpuCriticalAddresses.Contains(write.Address)));
-        AssertCpuCode(transport, 0);
+        int beforeSet = transport.WriteBatches.Count;
+        Throws<InvalidOperationException>(() => backend.Set(F7bsdFan.System, 20));
+        Equal(beforeSet, transport.WriteBatches.Count);
+        Equal((byte)0xff, transport.ByteAt(0x088b));
+        Equal((byte)0xff, transport.ByteAt(0x0889));
 
-        backend.Set(F7bsdFan.Cpu, 0);
-        Equal(1, transport.WriteBatches.Count);
+        backend.Dispose();
+        Equal(beforeSet, transport.WriteBatches.Count);
+        True(transport.Disposed);
+    }
+
+    private static void RawCpuTargetLifecycle()
+    {
+        FakeTransport transport = new();
+        transport.SetCpuBytes(
+        [
+            7, 52, 50, 12, 0, 255, 23,
+            255, 1, 88, 0, 17, 244, 9,
+        ]);
+        byte[] baseline = transport.CpuBytes();
+        byte[] critical = transport.CriticalBytes();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+
+        // Runtime temperatures, their effective values, and CPU override state
+        // are telemetry, not prerequisites for writing the normal target rows.
+        transport.SetByte(0x0309, 0);
+        transport.SetByte(0x0888, 200);
+        transport.SetByte(0x088a, 0x7e);
+        transport.SetByte(0x032f, 0xa5);
+        transport.SetByte(0x0311, 99);
+        Equal((byte)0, backend.Set(F7bsdFan.Cpu, 0));
+        AssertCpuFlat(transport, 0);
+        SequenceEqual(critical, transport.CriticalBytes());
+        AssertOnlyCpuTargetWrites(transport.WritesSince(0));
+
+        int beforeSecondSet = transport.WriteBatches.Count;
+        Equal((byte)51, backend.Set(F7bsdFan.Cpu, 51));
+        AssertCpuFlat(transport, 51);
+        SequenceEqual(critical, transport.CriticalBytes());
+        AssertOnlyCpuTargetWrites(transport.WritesSince(beforeSecondSet));
+
+        int beforeReset = transport.WriteBatches.Count;
+        backend.Reset(F7bsdFan.Cpu);
+        SequenceEqual(baseline, transport.CpuBytes());
+        SequenceEqual(critical, transport.CriticalBytes());
+        AssertOnlyCpuTargetWrites(transport.WritesSince(beforeReset));
+
+        int afterReset = transport.WriteBatches.Count;
+        backend.Reset(F7bsdFan.Cpu);
+        Equal(afterReset, transport.WriteBatches.Count);
+        Throws<ArgumentOutOfRangeException>(() => backend.Set(F7bsdFan.Cpu, 52));
+
+        backend.Dispose();
+        True(transport.Disposed);
+    }
+
+    private static void RawCpuFailureRestoresBaseline()
+    {
+        FakeTransport transport = new();
+        byte[] baseline = transport.CpuBytes();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+        transport.FailAfterWriteCalls.Add(1);
+
+        ThrowsAny<Exception>(() => backend.Set(F7bsdFan.Cpu, 31));
+        SequenceEqual(baseline, transport.CpuBytes());
 
         backend.Reset(F7bsdFan.Cpu);
-        Equal<byte?>(null, backend.CpuCode);
-        AssertCpuBaseline(transport);
-        Equal(2, transport.WriteBatches.Count);
-        backend.Reset(F7bsdFan.Cpu);
-        Equal(2, transport.WriteBatches.Count);
+        SequenceEqual(baseline, transport.CpuBytes());
+        backend.Dispose();
+    }
 
+    private static void CpuRestoreIgnoresMutableConfiguration()
+    {
+        FakeTransport transport = new();
+        byte[] baseline = transport.CpuBytes();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
         backend.Set(F7bsdFan.Cpu, 31);
-        Equal<byte?>((byte)31, backend.CpuCode);
+
+        // Selector, band, and critical-row bytes are owned by firmware. Their
+        // changing must not prevent restoration of the captured normal rows.
+        transport.SetByte(0x032f, 0xa5);
+        transport.SetByte(0x0311, 99);
+        transport.SetByte(0x0312, 98);
+        byte[] changedCritical = [4, 97, 91, 13];
+        for (int index = 0; index < CpuCriticalAddresses.Length; index++)
+        {
+            transport.SetByte(CpuCriticalAddresses[index], changedCritical[index]);
+        }
+
+        int beforeReset = transport.WriteBatches.Count;
+        backend.Reset(F7bsdFan.Cpu);
+        SequenceEqual(baseline, transport.CpuBytes());
+        SequenceEqual(changedCritical, transport.CriticalBytes());
+        AssertOnlyCpuTargetWrites(transport.WritesSince(beforeReset));
+
         backend.Dispose();
         True(transport.Disposed);
-        Equal<byte?>(null, backend.CpuCode);
-        AssertCpuBaseline(transport);
-        Throws<InvalidOperationException>(() => backend.Set(F7bsdFan.Cpu, 10));
-
-        FakeTransport changedConfiguration = new();
-        PawnIoF7bsdBackend changedBackend = CreateBackend(changedConfiguration);
-        changedBackend.Initialize();
-        changedConfiguration.SetByte(0x0311, 26);
-        Throws<PlatformNotSupportedException>(() => changedBackend.Set(F7bsdFan.Cpu, 20));
-        Equal(0, changedConfiguration.WriteBatches.Count);
-        changedConfiguration.SetByte(0x0311, 25);
-        changedBackend.Dispose();
-
-        FakeTransport overrideChanged = new();
-        PawnIoF7bsdBackend overrideBackend = CreateBackend(overrideChanged);
-        overrideBackend.Initialize();
-        overrideChanged.SetByte(0x088a, 1);
-        Throws<InvalidOperationException>(() => overrideBackend.Set(F7bsdFan.Cpu, 20));
-        Equal(0, overrideChanged.WriteBatches.Count);
-        overrideChanged.SetByte(0x088a, 0);
-        overrideBackend.Dispose();
-
-        FakeTransport invalidCodeTransport = new();
-        PawnIoF7bsdBackend invalidCodeBackend = CreateBackend(invalidCodeTransport);
-        invalidCodeBackend.Initialize();
-        Throws<ArgumentOutOfRangeException>(() => invalidCodeBackend.Set(F7bsdFan.Cpu, 52));
-        Equal(0, invalidCodeTransport.WriteBatches.Count);
-        invalidCodeBackend.Dispose();
     }
 
-    private static void BackendCpuFailureRestoration()
-    {
-        FakeTransport setFailure = new();
-        PawnIoF7bsdBackend setBackend = CreateBackend(setFailure);
-        setBackend.Initialize();
-        setFailure.FailAfterWriteCalls.Add(1);
-        Throws<IOException>(() => setBackend.Set(F7bsdFan.Cpu, 30));
-        Equal<byte?>(null, setBackend.CpuCode);
-        AssertCpuBaseline(setFailure);
-        Equal(2, setFailure.WriteBatches.Count);
-        setBackend.Dispose();
-        True(setFailure.Disposed);
-
-        FakeTransport continuation = new();
-        PawnIoF7bsdBackend continuationBackend = CreateBackend(continuation);
-        continuationBackend.Initialize();
-        continuationBackend.Set(F7bsdFan.Cpu, 28);
-        continuation.FailBeforeWriteCalls.UnionWith([2, 3, 4]);
-        Throws<AggregateException>(() => continuationBackend.Reset(F7bsdFan.Cpu));
-        Equal(4, continuation.WriteBatches.Count);
-        AssertCpuCode(continuation, 28);
-
-        continuationBackend.Dispose();
-        True(continuation.Disposed);
-        AssertCpuBaseline(continuation);
-    }
-
-    private static void CpuTransitionSnapshotPreconditions()
-    {
-        FakeTransport transport = new();
-        PawnIoF7bsdBackend backend = CreateBackend(transport);
-        backend.Initialize();
-        transport.BeforeWrite = call =>
-        {
-            if (call == 1)
-            {
-                // Simulate a firmware profile reload after the path was
-                // computed but before its first byte could be applied.
-                transport.SetByte(0x0311, 26);
-            }
-        };
-
-        Throws<AggregateException>(() => backend.Set(F7bsdFan.Cpu, 28));
-        Equal(1, transport.WriteBatches.Count);
-        Equal(0, transport.AppliedWriteBatches.Count);
-        AssertCpuBaseline(transport);
-
-        transport.BeforeWrite = null;
-        transport.SetByte(0x0311, 25);
-        backend.Dispose();
-    }
-
-    private static void ActivePolicyReloadRecovery()
-    {
-        FakeTransport transport = new();
-        PawnIoF7bsdBackend backend = CreateBackend(transport);
-        backend.Initialize();
-        backend.Set(F7bsdFan.Cpu, 28);
-        backend.Set(F7bsdFan.System, 0);
-        Equal(2, transport.WriteBatches.Count);
-
-        for (int index = 0; index < F7bsdProfile.CpuRestoreAddresses.Length; index++)
-        {
-            transport.SetByte(
-                F7bsdProfile.CpuRestoreAddresses[index],
-                transport.InitialCpuBaseline[index]);
-        }
-        for (int index = 0; index < F7bsdProfile.SystemThresholdAddresses.Length; index++)
-        {
-            transport.SetByte(
-                F7bsdProfile.SystemThresholdAddresses[index],
-                transport.InitialSystemBaseline[index]);
-        }
-
-        backend.ReadTelemetry();
-        Equal(4, transport.WriteBatches.Count);
-        AssertCpuCode(transport, 28);
-        AssertMemory(transport, F7bsdProfile.SystemWrites(SystemFanMode.Off));
-
-        backend.Dispose();
-        AssertCpuBaseline(transport);
-        AssertSystemBaseline(transport);
-
-        FakeTransport changedProfile = new();
-        PawnIoF7bsdBackend changedBackend = CreateBackend(changedProfile);
-        changedBackend.Initialize();
-        changedBackend.Set(F7bsdFan.Cpu, 28);
-        int writesBeforeReset = changedProfile.WriteBatches.Count;
-        changedProfile.SetByte(0x0311, 26);
-        Throws<AggregateException>(() => changedBackend.Reset(F7bsdFan.Cpu));
-        Equal(writesBeforeReset, changedProfile.WriteBatches.Count);
-        changedProfile.SetByte(0x0311, 25);
-        changedBackend.Dispose();
-    }
-
-    private static void SystemPoliciesAndThermalSeeds()
+    private static void RawSystemOwnershipLifecycle()
     {
         FakeTransport transport = new();
         PawnIoF7bsdBackend backend = CreateBackend(transport);
         backend.Initialize();
 
+        transport.SetByte(0x088a, 0x7e);
+        int start = transport.WriteBatches.Count;
         Equal((byte)0, backend.Set(F7bsdFan.System, 0));
-        Equal<SystemFanMode?>(SystemFanMode.Off, backend.SystemMode);
-        SequenceEqual(F7bsdProfile.SystemWrites(SystemFanMode.Off), transport.WriteBatches[0]);
-        AssertMemory(transport, F7bsdProfile.SystemWrites(SystemFanMode.Off));
+        SequenceEqual(
+            [new EcWrite(0x088b, 0xff), new EcWrite(0x0885, 0)],
+            transport.WritesSince(start));
+        AssertSystemOwned(transport, 0);
+        AssertNoPolicyOrPwmWrites(transport.WritesSince(start));
+        AssertOwnershipWasVerifiedBetweenWrites(transport, start);
 
-        backend.Set(F7bsdFan.System, 9);
-        Equal(1, transport.WriteBatches.Count);
+        start = transport.WriteBatches.Count;
+        Equal((byte)17, backend.Set(F7bsdFan.System, 17));
+        SequenceEqual([new EcWrite(0x0885, 17)], transport.WritesSince(start));
+        AssertSystemOwned(transport, 17);
 
-        Equal((byte)20, backend.Set(F7bsdFan.System, 10));
-        Equal<SystemFanMode?>(SystemFanMode.Quiet, backend.SystemMode);
-        SequenceEqual(F7bsdProfile.SystemWrites(SystemFanMode.Quiet), transport.WriteBatches[1]);
-        backend.Set(F7bsdFan.System, 35);
-        Equal(2, transport.WriteBatches.Count);
+        start = transport.WriteBatches.Count;
+        Equal((byte)17, backend.Set(F7bsdFan.System, 17));
+        SequenceEqual([new EcWrite(0x0885, 17)], transport.WritesSince(start));
+        AssertSystemOwned(transport, 17);
 
-        Equal((byte)51, backend.Set(F7bsdFan.System, 36));
-        Equal<SystemFanMode?>(SystemFanMode.Full, backend.SystemMode);
-        SequenceEqual(F7bsdProfile.SystemWrites(SystemFanMode.Full), transport.WriteBatches[2]);
-        backend.Set(F7bsdFan.System, 51);
-        Equal(3, transport.WriteBatches.Count);
+        // Simulate the firmware dropping manual ownership between Fan Control
+        // update ticks. The next Set must re-engage even when the code is unchanged.
+        transport.SetByte(0x088b, 0);
+        transport.SetByte(0x0889, transport.ByteAt(0x0305));
+        start = transport.WriteBatches.Count;
+        Equal((byte)17, backend.Set(F7bsdFan.System, 17));
+        SequenceEqual(
+            [new EcWrite(0x088b, 0xff), new EcWrite(0x0885, 17)],
+            transport.WritesSince(start));
+        AssertSystemOwned(transport, 17);
 
+        start = transport.WriteBatches.Count;
+        Equal((byte)51, backend.Set(F7bsdFan.System, 51));
+        SequenceEqual([new EcWrite(0x0885, 51)], transport.WritesSince(start));
+        AssertSystemOwned(transport, 51);
+
+        start = transport.WriteBatches.Count;
         backend.Reset(F7bsdFan.System);
-        Equal<SystemFanMode?>(null, backend.SystemMode);
-        AssertSystemBaseline(transport);
-        Equal(6, transport.WriteBatches.Count);
-        backend.Reset(F7bsdFan.System);
-        Equal(6, transport.WriteBatches.Count);
+        SequenceEqual(
+            [new EcWrite(0x0885, 51), new EcWrite(0x088b, 0)],
+            transport.WritesSince(start));
+        Equal((byte)0, transport.ByteAt(0x088b));
+        Equal(transport.ByteAt(0x0305), transport.ByteAt(0x0889));
 
-        backend.Set(F7bsdFan.System, 10);
+        int afterReset = transport.WriteBatches.Count;
+        backend.Reset(F7bsdFan.System);
+        Equal(afterReset, transport.WriteBatches.Count);
         backend.Dispose();
         True(transport.Disposed);
-        AssertSystemBaseline(transport);
-
-        foreach (byte raw in new byte[] { 0, 100, 121 })
-        {
-            FakeTransport guarded = new();
-            guarded.SetSystemTemperature(raw, raw);
-            PawnIoF7bsdBackend guardedBackend = CreateBackend(guarded);
-            if (raw is 0 or 121)
-            {
-                // Initialization rejects an invalid sensor, so inject it only after capture.
-                guarded.SetSystemTemperature(44, 44);
-                guardedBackend.Initialize();
-                guarded.SetSystemTemperature(raw, raw);
-            }
-            else
-            {
-                guardedBackend.Initialize();
-            }
-
-            guarded.SetByte(0x0885, 20);
-            byte applied = guardedBackend.Set(F7bsdFan.System, 10);
-            SystemFanMode appliedMode = raw is 0 or 121
-                ? SystemFanMode.Full
-                : SystemFanMode.Quiet;
-            Equal(F7bsdProfile.SystemModeCode(appliedMode), applied);
-            SequenceEqual(
-                [new EcWrite(0x0885, F7bsdProfile.MaximumCode)],
-                guarded.WriteBatches[0]);
-            SequenceEqual(
-                F7bsdProfile.SystemWrites(appliedMode),
-                guarded.WriteBatches[1]);
-            Equal(F7bsdProfile.MaximumCode, guarded.ByteAt(0x0885));
-
-            if (raw is 0 or 121)
-            {
-                Throws<InvalidOperationException>(() =>
-                    guardedBackend.Reset(F7bsdFan.System));
-                AssertMemory(guarded, F7bsdProfile.SystemWrites(SystemFanMode.Full));
-                for (int index = 0;
-                    index < F7bsdProfile.SystemThresholdAddresses.Length;
-                    index++)
-                {
-                    guarded.SetByte(
-                        F7bsdProfile.SystemThresholdAddresses[index],
-                        guarded.InitialSystemBaseline[index]);
-                }
-                guarded.SetByte(0x0885, 20);
-                guardedBackend.ReadTelemetry();
-                AssertMemory(guarded, F7bsdProfile.SystemWrites(SystemFanMode.Full));
-                Equal(F7bsdProfile.MaximumCode, guarded.ByteAt(0x0885));
-                guarded.SetSystemTemperature(44, 44);
-            }
-            else
-            {
-                guarded.SetByte(0x0885, 20);
-                guardedBackend.Reset(F7bsdFan.System);
-                SequenceEqual(
-                    [new EcWrite(0x0885, F7bsdProfile.MaximumCode)],
-                    guarded.WriteBatches[2]);
-                AssertSystemBaseline(guarded);
-            }
-            guardedBackend.Dispose();
-            AssertSystemBaseline(guarded);
-        }
-
-        FakeTransport overrideChanged = new();
-        PawnIoF7bsdBackend overrideBackend = CreateBackend(overrideChanged);
-        overrideBackend.Initialize();
-        overrideChanged.SetByte(0x088b, 0xff);
-        Throws<InvalidOperationException>(() => overrideBackend.Set(F7bsdFan.System, 20));
-        Equal(0, overrideChanged.WriteBatches.Count);
-        overrideChanged.SetByte(0x088b, 0);
-        overrideBackend.Dispose();
     }
 
-    private static void SystemFailureRestoration()
+    private static void RawSystemOwnershipFailureRecovery()
     {
-        FakeTransport setFailure = new();
-        PawnIoF7bsdBackend setBackend = CreateBackend(setFailure);
-        setBackend.Initialize();
-        setFailure.FailAfterWriteCalls.Add(1);
-        Throws<IOException>(() => setBackend.Set(F7bsdFan.System, 20));
-        Equal<SystemFanMode?>(null, setBackend.SystemMode);
-        AssertSystemBaseline(setFailure);
-        Equal(4, setFailure.WriteBatches.Count);
-        setBackend.Dispose();
+        FakeTransport transport = new() { AutoSystemOwnership = false };
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
 
-        FakeTransport continuation = new();
-        PawnIoF7bsdBackend continuationBackend = CreateBackend(continuation);
-        continuationBackend.Initialize();
-        continuationBackend.Set(F7bsdFan.System, 0);
-        continuation.FailBeforeWriteCalls.Add(2);
-        Throws<AggregateException>(() => continuationBackend.Reset(F7bsdFan.System));
-        Equal(4, continuation.WriteBatches.Count);
-        Equal((byte)25, continuation.ByteAt(0x0331));
-        False(continuation.ByteAt(0x0334) == 83);
-        Equal((byte)100, continuation.ByteAt(0x0337));
-        continuationBackend.Dispose();
-        True(continuation.Disposed);
-        AssertSystemBaseline(continuation);
+        ThrowsAny<Exception>(() => backend.Set(F7bsdFan.System, 20));
+        False(transport.AppliedWrites.Any(write =>
+            write.Address == 0x0885 && write.Value == 20));
 
-        FakeTransport hotSeedFailure = new();
-        PawnIoF7bsdBackend hotBackend = CreateBackend(hotSeedFailure);
-        hotBackend.Initialize();
-        hotSeedFailure.SetSystemTemperature(100, 100);
-        hotSeedFailure.FailAfterWriteCalls.Add(1);
-        Throws<IOException>(() => hotBackend.Set(F7bsdFan.System, 0));
-        Equal(F7bsdProfile.MaximumCode, hotSeedFailure.ByteAt(0x0885));
-        AssertSystemBaseline(hotSeedFailure);
-        hotBackend.Dispose();
-
-        FakeTransport invalidRetry = new();
-        PawnIoF7bsdBackend invalidRetryBackend = CreateBackend(invalidRetry);
-        invalidRetryBackend.Initialize();
-        invalidRetryBackend.Set(F7bsdFan.System, 0);
-        invalidRetry.SetSystemTemperature(0, 0);
-        invalidRetry.FailBeforeWriteCalls.Add(2);
-        Throws<IOException>(() => invalidRetryBackend.Reset(F7bsdFan.System));
-        invalidRetry.FailBeforeWriteCalls.Clear();
-        Throws<InvalidOperationException>(() =>
-            invalidRetryBackend.Reset(F7bsdFan.System));
-        AssertMemory(invalidRetry, F7bsdProfile.SystemWrites(SystemFanMode.Full));
-        invalidRetry.SetSystemTemperature(44, 44);
-        invalidRetryBackend.Dispose();
-        AssertSystemBaseline(invalidRetry);
-
-        FakeTransport failedInvalidRecovery = new();
-        PawnIoF7bsdBackend failedInvalidBackend = CreateBackend(failedInvalidRecovery);
-        failedInvalidBackend.Initialize();
-        failedInvalidRecovery.SetSystemTemperature(0, 0);
-        failedInvalidRecovery.FailBeforeWriteCalls.UnionWith([1, 2]);
-        Throws<AggregateException>(() =>
-            failedInvalidBackend.Set(F7bsdFan.System, 0));
-        failedInvalidRecovery.FailBeforeWriteCalls.Clear();
-        failedInvalidRecovery.SetByte(0x0885, 0);
-        failedInvalidBackend.ReadTelemetry();
-        Equal(F7bsdProfile.MaximumCode, failedInvalidRecovery.ByteAt(0x0885));
-        AssertMemory(
-            failedInvalidRecovery,
-            F7bsdProfile.SystemWrites(SystemFanMode.Full));
-        failedInvalidRecovery.SetSystemTemperature(44, 44);
-        failedInvalidBackend.Dispose();
-        AssertSystemBaseline(failedInvalidRecovery);
-
-        FakeTransport staleHotTarget = new();
-        PawnIoF7bsdBackend staleHotBackend = CreateBackend(staleHotTarget);
-        staleHotBackend.Initialize();
-        staleHotBackend.Set(F7bsdFan.System, 51);
-        staleHotTarget.SetSystemTemperature(121, 121);
-        staleHotTarget.SetByte(0x0885, F7bsdProfile.MaximumCode);
-        staleHotTarget.AfterRead = (_, addresses) =>
-        {
-            if (addresses.SequenceEqual(F7bsdProfile.TelemetryAddresses))
-            {
-                staleHotTarget.SetByte(0x0885, 0);
-                staleHotTarget.AfterRead = null;
-            }
-        };
-        staleHotBackend.ReadTelemetry();
-        Equal(F7bsdProfile.MaximumCode, staleHotTarget.ByteAt(0x0885));
-        staleHotTarget.SetSystemTemperature(44, 44);
-        staleHotBackend.Dispose();
-        AssertSystemBaseline(staleHotTarget);
+        transport.AutoSystemOwnership = true;
+        backend.Reset(F7bsdFan.System);
+        Equal((byte)51, transport.ByteAt(0x0885));
+        Equal((byte)0, transport.ByteAt(0x088b));
+        Equal(transport.ByteAt(0x0305), transport.ByteAt(0x0889));
+        backend.Dispose();
     }
 
-    private static void BackendCloseRestorationContinuation()
+    private static void RawSystemReleaseRetry()
     {
         FakeTransport transport = new();
         PawnIoF7bsdBackend backend = CreateBackend(transport);
         backend.Initialize();
-        backend.Set(F7bsdFan.Cpu, 28);
-        backend.Set(F7bsdFan.System, 0);
+        backend.Set(F7bsdFan.System, 12);
+        transport.AutoSystemRelease = false;
 
-        // Dispose restores system first. Fail its first threshold write and
-        // verify that all later system writes and the complete CPU restore
-        // are still attempted before the transport is closed.
-        transport.FailBeforeWriteCalls.Add(3);
-        Throws<AggregateException>(backend.Dispose);
-        True(transport.Disposed);
-        Equal<byte?>(null, backend.CpuCode);
-        Equal<SystemFanMode?>(null, backend.SystemMode);
-        AssertCpuBaseline(transport);
-        False(transport.ByteAt(0x0334) == transport.InitialSystemBaseline[1]);
-        Equal(transport.InitialSystemBaseline[0], transport.ByteAt(0x0331));
-        Equal(transport.InitialSystemBaseline[2], transport.ByteAt(0x0337));
-        Equal(6, transport.WriteBatches.Count);
+        ThrowsAny<Exception>(() => backend.Reset(F7bsdFan.System));
+        Equal((byte)51, transport.ByteAt(0x0885));
+
+        transport.AutoSystemRelease = true;
+        backend.Reset(F7bsdFan.System);
+        Equal((byte)0, transport.ByteAt(0x088b));
+        Equal(transport.ByteAt(0x0305), transport.ByteAt(0x0889));
+        backend.Dispose();
     }
 
-    private static void PluginSensorAndControlLifecycle()
+    private static void RawTargetsAreNotThermallyPromoted()
+    {
+        FakeTransport transport = new();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+
+        // Once initialization has identified the known controller, target
+        // selection stays raw: the plugin does not replace Fan Control's value
+        // with an internal thermal policy.
+        transport.SetByte(0x0309, 120);
+        transport.SetByte(0x0888, 120);
+        transport.SetByte(0x0305, 120);
+        transport.SetByte(0x0889, 120);
+        Equal((byte)0, backend.Set(F7bsdFan.Cpu, 0));
+        Equal((byte)0, backend.Set(F7bsdFan.System, 0));
+        AssertCpuFlat(transport, 0);
+        AssertSystemOwned(transport, 0);
+
+        backend.Dispose();
+    }
+
+    private static void TelemetryWhileSystemOwned()
+    {
+        FakeTransport transport = new();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+        backend.Set(F7bsdFan.System, 26);
+
+        F7bsdTelemetry telemetry = backend.ReadTelemetry();
+        Equal(2_156, telemetry.CpuFanRpm);
+        Equal(1_725, telemetry.SystemFanRpm);
+        Equal(56, telemetry.CpuTemperatureC);
+        Equal(44, telemetry.SystemTemperatureC);
+        AssertSystemOwned(transport, 26);
+
+        backend.Reset(F7bsdFan.System);
+        backend.Dispose();
+    }
+
+    private static void PeriodicSetReassertsRawTargets()
+    {
+        FakeTransport transport = new();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+        backend.Set(F7bsdFan.Cpu, 17);
+        backend.Set(F7bsdFan.System, 18);
+
+        transport.SetByte(CpuBaseAddresses[0], 3);
+        transport.SetByte(0x0885, 4);
+        int beforeTelemetry = transport.WriteBatches.Count;
+        backend.ReadTelemetry();
+        Equal(beforeTelemetry, transport.WriteBatches.Count);
+        Equal((byte)3, transport.ByteAt(CpuBaseAddresses[0]));
+        Equal((byte)4, transport.ByteAt(0x0885));
+
+        backend.Set(F7bsdFan.Cpu, 17);
+        backend.Set(F7bsdFan.System, 18);
+        AssertCpuFlat(transport, 17);
+        AssertSystemOwned(transport, 18);
+        backend.Dispose();
+    }
+
+    private static void CloseRestoresBothControls()
+    {
+        FakeTransport transport = new();
+        byte[] baseline = transport.CpuBytes();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+        backend.Set(F7bsdFan.Cpu, 9);
+        backend.Set(F7bsdFan.System, 23);
+
+        backend.Dispose();
+        True(transport.Disposed);
+        SequenceEqual(baseline, transport.CpuBytes());
+        Equal((byte)51, transport.ByteAt(0x0885));
+        Equal((byte)0, transport.ByteAt(0x088b));
+
+        int afterDispose = transport.WriteBatches.Count;
+        backend.Dispose();
+        Equal(afterDispose, transport.WriteBatches.Count);
+    }
+
+    private static void CloseContinuesAfterRestoreFailure()
+    {
+        FakeTransport transport = new();
+        byte[] baseline = transport.CpuBytes();
+        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        backend.Initialize();
+        backend.Set(F7bsdFan.Cpu, 9);
+        backend.Set(F7bsdFan.System, 23);
+        transport.AutoSystemRelease = false;
+
+        ThrowsAny<Exception>(backend.Dispose);
+        True(transport.Disposed);
+        SequenceEqual(baseline, transport.CpuBytes());
+    }
+
+    private static void PluginSensorAndRawControlLifecycle()
     {
         FakeBackend backend = new(
             Sample(3_000, 1_900, 62, 41),
@@ -832,25 +597,9 @@ internal static class Program
         {
             plugin.Initialize();
             plugin.Load(container);
-            Equal("Minisforum UM780 XTX (F7BSD)", plugin.Name);
-            SequenceEqual(
-                [
-                    "minisforum.um780xtx.f7bsd.fan1",
-                    "minisforum.um780xtx.f7bsd.fan2",
-                ],
-                container.FanSensors.Select(sensor => sensor.Id));
-            SequenceEqual(
-                [
-                    "minisforum.um780xtx.f7bsd.cpu-temperature",
-                    "minisforum.um780xtx.f7bsd.system-temperature",
-                ],
-                container.TempSensors.Select(sensor => sensor.Id));
-            SequenceEqual(
-                [
-                    "minisforum.um780xtx.f7bsd.cpu-control",
-                    "minisforum.um780xtx.f7bsd.system-control",
-                ],
-                container.ControlSensors.Select(sensor => sensor.Id));
+            Equal(1, backend.InitializeCalls);
+            Equal(4, container.FanSensors.Count + container.TempSensors.Count);
+            Equal(2, container.ControlSensors.Count);
 
             IPluginControlSensor2 cpu = FindControl(
                 container.ControlSensors,
@@ -859,7 +608,7 @@ internal static class Program
                 container.ControlSensors,
                 "minisforum.um780xtx.f7bsd.system-control");
             Equal("UM780 XTX CPU Fan Control", cpu.Name);
-            Equal("UM780 XTX System Fan Mode", system.Name);
+            Equal("UM780 XTX System Fan Control", system.Name);
             Equal(
                 $"{plugin.Name}/minisforum.um780xtx.f7bsd.fan1",
                 cpu.PairedFanSensorId);
@@ -873,21 +622,25 @@ internal static class Program
                 container.TempSensors,
                 "minisforum.um780xtx.f7bsd.system-temperature").Value);
 
+            cpu.Set(0f);
+            system.Set(1f);
             cpu.Set(50f);
-            system.Set(50f);
+            system.Set(100f);
             SequenceEqual(
                 [
+                    (F7bsdFan.Cpu, (byte)0),
+                    (F7bsdFan.System, (byte)1),
                     (F7bsdFan.Cpu, (byte)26),
-                    (F7bsdFan.System, (byte)26),
+                    (F7bsdFan.System, (byte)51),
                 ],
                 backend.SetCalls);
             Equal<float?>(F7bsdProfile.ToPercentage(26), cpu.Value);
-            Equal<float?>(F7bsdProfile.ToPercentage(20), system.Value);
+            Equal<float?>(100f, system.Value);
 
             cpu.Reset();
             SequenceEqual([F7bsdFan.Cpu], backend.ResetCalls);
             Equal<float?>(null, cpu.Value);
-            Equal<float?>(F7bsdProfile.ToPercentage(20), system.Value);
+            Equal<float?>(100f, system.Value);
 
             plugin.Update();
             Equal(3_100f, Find(
@@ -899,9 +652,6 @@ internal static class Program
             Equal(63f, Find(
                 container.TempSensors,
                 "minisforum.um780xtx.f7bsd.cpu-temperature").Value);
-            Equal(42f, Find(
-                container.TempSensors,
-                "minisforum.um780xtx.f7bsd.system-temperature").Value);
 
             plugin.Close();
             Equal(1, backend.DisposeCalls);
@@ -910,15 +660,6 @@ internal static class Program
             Equal<float?>(null, Find(
                 container.FanSensors,
                 "minisforum.um780xtx.f7bsd.fan1").Value);
-            Equal<float?>(null, Find(
-                container.FanSensors,
-                "minisforum.um780xtx.f7bsd.fan2").Value);
-            Equal<float?>(null, Find(
-                container.TempSensors,
-                "minisforum.um780xtx.f7bsd.cpu-temperature").Value);
-            Equal<float?>(null, Find(
-                container.TempSensors,
-                "minisforum.um780xtx.f7bsd.system-temperature").Value);
             plugin.Close();
             Equal(1, backend.DisposeCalls);
             True(logger.Messages.Any(message => message.Contains("initialized")));
@@ -943,11 +684,11 @@ internal static class Program
         {
             plugin.Initialize();
             plugin.Load(container);
-            IPluginControlSensor2 cpu = FindControl(
+            IPluginControlSensor2 system = FindControl(
                 container.ControlSensors,
-                "minisforum.um780xtx.f7bsd.cpu-control");
-            cpu.Set(25f);
-            float? confirmedControl = cpu.Value;
+                "minisforum.um780xtx.f7bsd.system-control");
+            system.Set(25f);
+            float? confirmedControl = system.Value;
 
             plugin.Update();
             Equal<float?>(null, Find(
@@ -956,7 +697,7 @@ internal static class Program
             Equal<float?>(null, Find(
                 container.TempSensors,
                 "minisforum.um780xtx.f7bsd.system-temperature").Value);
-            Equal(confirmedControl, cpu.Value);
+            Equal(confirmedControl, system.Value);
             Equal(0, backend.DisposeCalls);
             True(logger.Messages.Any(message =>
                 message.Contains("telemetry read failed", StringComparison.Ordinal)));
@@ -971,7 +712,7 @@ internal static class Program
             Equal(61f, Find(
                 container.TempSensors,
                 "minisforum.um780xtx.f7bsd.cpu-temperature").Value);
-            Equal(confirmedControl, cpu.Value);
+            Equal(confirmedControl, system.Value);
         }
         finally
         {
@@ -1008,48 +749,60 @@ internal static class Program
         True(transport.Disposed);
     }
 
-    private static void AssertCpuBaseline(FakeTransport transport)
+    private static void AssertCpuFlat(FakeTransport transport, byte code)
     {
-        SequenceEqual(
-            transport.InitialCpuBaseline,
-            F7bsdProfile.CpuRestoreAddresses.Select(transport.ByteAt));
+        SequenceEqual(Enumerable.Repeat(code, 7),
+            CpuBaseAddresses.Select(transport.ByteAt));
+        SequenceEqual(Enumerable.Repeat((byte)0, 7),
+            CpuSlopeAddresses.Select(transport.ByteAt));
     }
 
-    private static void AssertCpuCode(FakeTransport transport, byte code)
+    private static void AssertOnlyCpuTargetWrites(IEnumerable<EcWrite> writes)
     {
-        CpuConfiguration configuration = F7bsdProfile.ValidateCpuConfiguration(
-            F7bsdProfile.CpuConfigurationAddresses.Select(transport.ByteAt).ToArray());
-        byte[] expected = F7bsdProfile.CpuBytes(
-            F7bsdProfile.CompileCpuCurve(code, configuration.Bands));
-        SequenceEqual(
-            expected,
-            F7bsdProfile.CpuRestoreAddresses.Select(transport.ByteAt));
+        HashSet<ushort> allowed = [.. CpuRestoreAddresses];
+        EcWrite[] materialized = writes.ToArray();
+        True(materialized.Length > 0);
+        True(materialized.All(write => allowed.Contains(write.Address)));
+        False(materialized.Any(write => CpuCriticalAddresses.Contains(write.Address)));
+        AssertNoPolicyOrPwmWrites(materialized);
     }
 
-    private static void AssertSystemBaseline(FakeTransport transport)
+    private static void AssertNoPolicyOrPwmWrites(IEnumerable<EcWrite> writes)
     {
-        SequenceEqual(
-            transport.InitialSystemBaseline,
-            F7bsdProfile.SystemThresholdAddresses.Select(transport.ByteAt));
+        ushort[] forbidden = [0x0331, 0x0334, 0x0337, 0x1803, 0x1804];
+        False(writes.Any(write => forbidden.Contains(write.Address)));
     }
 
-    private static void AssertMemory(FakeTransport transport, IEnumerable<EcWrite> writes)
+    private static void AssertSystemOwned(FakeTransport transport, byte code)
     {
-        foreach (EcWrite write in writes)
-        {
-            Equal(write.Value, transport.ByteAt(write.Address));
-        }
+        Equal((byte)0xff, transport.ByteAt(0x088b));
+        Equal((byte)0xff, transport.ByteAt(0x0889));
+        Equal(code, transport.ByteAt(0x0885));
+    }
+
+    private static void AssertOwnershipWasVerifiedBetweenWrites(
+        FakeTransport transport,
+        int firstWriteBatch)
+    {
+        int sentinelOperation = transport.Operations.FindIndex(item =>
+            item == "W:088B=FF");
+        int targetOperation = transport.Operations.FindIndex(item =>
+            item == "W:0885=00");
+        True(firstWriteBatch == 0 || sentinelOperation >= 0);
+        True(sentinelOperation >= 0);
+        True(targetOperation > sentinelOperation);
+        True(transport.Operations
+            .Skip(sentinelOperation + 1)
+            .Take(targetOperation - sentinelOperation - 1)
+            .Any(item => item.StartsWith("R:", StringComparison.Ordinal) &&
+                item.Contains("0889", StringComparison.Ordinal)));
     }
 
     private static byte[] TelemetryBytes(
         ushort cpuCounter,
         ushort systemCounter,
         byte cpuTemperature,
-        byte systemTemperature,
-        byte cpuTarget = 22,
-        byte systemTarget = 20,
-        byte cpuOverride = 0,
-        byte systemOverride = 0)
+        byte systemTemperature)
     {
         byte cpuLow = (byte)cpuCounter;
         byte systemLow = (byte)systemCounter;
@@ -1063,12 +816,6 @@ internal static class Program
             systemLow,
             cpuTemperature,
             systemTemperature,
-            cpuTarget,
-            systemTarget,
-            cpuTemperature,
-            systemTemperature,
-            cpuOverride,
-            systemOverride,
         ];
     }
 
@@ -1080,13 +827,7 @@ internal static class Program
             cpuRpm,
             systemRpm,
             cpuTemperature,
-            systemTemperature,
-            22,
-            20,
-            (byte)cpuTemperature,
-            (byte)systemTemperature,
-            0,
-            0);
+            systemTemperature);
 
     private static IPluginSensor Find(List<IPluginSensor> sensors, string id) =>
         sensors.Single(sensor => sensor.Id == id);
@@ -1152,6 +893,21 @@ internal static class Program
         throw new InvalidOperationException($"Expected {typeof(T).Name}.");
     }
 
+    private static void ThrowsAny<T>(Action action)
+        where T : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (T)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+    }
+
     private sealed class FakeContainer : IPluginSensorsContainer
     {
         public List<IPluginControlSensor> ControlSensors { get; } = [];
@@ -1168,18 +924,6 @@ internal static class Program
 
     private sealed class FakeTransport : IF7bsdTransport
     {
-        private static readonly (byte Base, byte Upper, byte Lower, byte Slope)[] Default =
-        [
-            (0, 25, 0, 0),
-            (16, 45, 25, 10),
-            (18, 54, 45, 33),
-            (21, 66, 54, 58),
-            (28, 76, 66, 60),
-            (34, 88, 76, 16),
-            (36, 93, 88, 200),
-            (51, 100, 93, 0),
-        ];
-
         private static readonly (byte Base, byte Upper, byte Lower, byte Slope)[] B1 =
         [
             (0, 25, 0, 0),
@@ -1192,41 +936,32 @@ internal static class Program
             (51, 100, 93, 0),
         ];
 
-        private static readonly (byte Base, byte Upper, byte Lower, byte Slope)[] B2 =
-        [
-            (0, 25, 0, 0),
-            (18, 45, 25, 15),
-            (21, 54, 45, 77),
-            (28, 66, 54, 66),
-            (36, 80, 66, 40),
-            (42, 88, 80, 50),
-            (46, 93, 88, 100),
-            (51, 100, 93, 0),
-        ];
-
         private readonly Dictionary<ushort, byte> memory = [];
         private int readCalls;
         private int writeCalls;
 
-        internal FakeTransport(byte selector = 0xb1)
+        internal FakeTransport()
         {
-            for (int index = 0; index < F7bsdProfile.ControllerProfileAddresses.Length; index++)
+            for (int index = 0;
+                index < F7bsdProfile.ControllerProfileAddresses.Length;
+                index++)
             {
                 memory[F7bsdProfile.ControllerProfileAddresses[index]] =
                     F7bsdProfile.ExpectedControllerProfile[index];
             }
-            InstallCpuProfile(selector);
+            memory[0x032f] = 0xb1;
+            for (int row = 0; row < B1.Length; row++)
+            {
+                ushort baseAddress = (ushort)(0x0310 + (row * 3));
+                memory[baseAddress] = B1[row].Base;
+                memory[(ushort)(baseAddress + 1)] = B1[row].Upper;
+                memory[(ushort)(baseAddress + 2)] = B1[row].Lower;
+                memory[(ushort)(0x08b0 + row)] = B1[row].Slope;
+            }
             memory[0x0331] = 25;
             memory[0x0334] = 83;
             memory[0x0337] = 100;
             InstallTelemetry(TelemetryBytes(1_000, 1_250, 56, 44));
-
-            InitialCpuBaseline = F7bsdProfile.CpuRestoreAddresses
-                .Select(ByteAt)
-                .ToArray();
-            InitialSystemBaseline = F7bsdProfile.SystemThresholdAddresses
-                .Select(ByteAt)
-                .ToArray();
         }
 
         internal List<ushort[]> ReadBatches { get; } = [];
@@ -1235,30 +970,32 @@ internal static class Program
 
         internal List<EcWrite[]> AppliedWriteBatches { get; } = [];
 
+        internal List<string> Operations { get; } = [];
+
         internal HashSet<int> FailReadCalls { get; } = [];
 
         internal HashSet<int> FailBeforeWriteCalls { get; } = [];
 
         internal HashSet<int> FailAfterWriteCalls { get; } = [];
 
-        internal byte[] InitialCpuBaseline { get; }
+        internal bool AutoSystemOwnership { get; set; } = true;
 
-        internal byte[] InitialSystemBaseline { get; }
+        internal bool AutoSystemRelease { get; set; } = true;
 
         internal int UnstableTelemetryReadsRemaining { get; set; }
-
-        internal Action<int>? BeforeWrite { get; set; }
-
-        internal Action<int, ushort[]>? AfterRead { get; set; }
 
         internal bool Disposed { get; private set; }
 
         internal byte[] PnpIdentity { get; set; } =
             (byte[])F7bsdProfile.ExpectedPnpIdentity.Clone();
 
+        internal IEnumerable<EcWrite> AppliedWrites =>
+            AppliedWriteBatches.SelectMany(batch => batch);
+
         public byte[] ReadPnpIdentity()
         {
             ObjectDisposedException.ThrowIf(Disposed, this);
+            Operations.Add("PNP");
             return (byte[])PnpIdentity.Clone();
         }
 
@@ -1266,7 +1003,10 @@ internal static class Program
         {
             ObjectDisposedException.ThrowIf(Disposed, this);
             readCalls++;
-            ReadBatches.Add((ushort[])addresses.Clone());
+            ushort[] copy = (ushort[])addresses.Clone();
+            ReadBatches.Add(copy);
+            Operations.Add("R:" + string.Join(",", copy.Select(address =>
+                address.ToString("X4"))));
             if (FailReadCalls.Contains(readCalls))
             {
                 throw new IOException($"Expected fake read failure {readCalls}.");
@@ -1279,37 +1019,36 @@ internal static class Program
                 UnstableTelemetryReadsRemaining--;
                 result[2] = unchecked((byte)(result[0] + 1));
             }
-            AfterRead?.Invoke(readCalls, addresses);
             return result;
         }
 
-        public void Write(EcWrite[] writes, EcExpectation[]? expectations = null)
+        public void Write(EcWrite[] writes)
         {
             ObjectDisposedException.ThrowIf(Disposed, this);
             writeCalls++;
             EcWrite[] copy = (EcWrite[])writes.Clone();
             WriteBatches.Add(copy);
+            foreach (EcWrite write in copy)
+            {
+                Operations.Add($"W:{write.Address:X4}={write.Value:X2}");
+            }
             if (FailBeforeWriteCalls.Contains(writeCalls))
             {
                 throw new IOException($"Expected fake pre-write failure {writeCalls}.");
-            }
-            BeforeWrite?.Invoke(writeCalls);
-            if (expectations is not null)
-            {
-                foreach (EcExpectation expectation in expectations)
-                {
-                    if (ByteAt(expectation.Address) != expectation.Value)
-                    {
-                        throw new IOException(
-                            $"Expected fake precondition failure at " +
-                            $"0x{expectation.Address:X4}.");
-                    }
-                }
             }
             AppliedWriteBatches.Add(copy);
             foreach (EcWrite write in copy)
             {
                 memory[write.Address] = write.Value;
+                if (write.Address == 0x088b && write.Value == 0xff &&
+                    AutoSystemOwnership)
+                {
+                    memory[0x0889] = 0xff;
+                }
+                if (write.Address == 0x088b && write.Value == 0 && AutoSystemRelease)
+                {
+                    memory[0x0889] = memory[0x0305];
+                }
             }
             if (FailAfterWriteCalls.Contains(writeCalls))
             {
@@ -1325,31 +1064,26 @@ internal static class Program
 
         internal void SetByte(ushort address, byte value) => memory[address] = value;
 
-        internal void SetSystemTemperature(byte raw, byte effective)
+        internal void SetCpuBytes(ReadOnlySpan<byte> values)
         {
-            memory[0x0305] = raw;
-            memory[0x0889] = effective;
-        }
-
-        private void InstallCpuProfile(byte selector)
-        {
-            (byte Base, byte Upper, byte Lower, byte Slope)[] rows = selector switch
+            if (values.Length != CpuRestoreAddresses.Length)
             {
-                0 => Default,
-                0xb2 => B2,
-                0xb1 => B1,
-                _ => B1,
-            };
-            memory[0x032f] = selector;
-            for (int row = 0; row < rows.Length; row++)
+                throw new ArgumentException("Unexpected fake CPU byte count.", nameof(values));
+            }
+            for (int index = 0; index < CpuRestoreAddresses.Length; index++)
             {
-                ushort baseAddress = (ushort)(0x0310 + (row * 3));
-                memory[baseAddress] = rows[row].Base;
-                memory[(ushort)(baseAddress + 1)] = rows[row].Upper;
-                memory[(ushort)(baseAddress + 2)] = rows[row].Lower;
-                memory[(ushort)(0x08b0 + row)] = rows[row].Slope;
+                memory[CpuRestoreAddresses[index]] = values[index];
             }
         }
+
+        internal byte[] CpuBytes() => CpuRestoreAddresses.Select(ByteAt).ToArray();
+
+        internal byte[] CriticalBytes() => CpuCriticalAddresses.Select(ByteAt).ToArray();
+
+        internal EcWrite[] WritesSince(int batchIndex) => WriteBatches
+            .Skip(batchIndex)
+            .SelectMany(batch => batch)
+            .ToArray();
 
         private void InstallTelemetry(byte[] values)
         {
@@ -1405,9 +1139,7 @@ internal static class Program
         public byte Set(F7bsdFan fan, byte requestedCode)
         {
             SetCalls.Add((fan, requestedCode));
-            return fan == F7bsdFan.System
-                ? F7bsdProfile.SystemModeCode(F7bsdProfile.SystemMode(requestedCode))
-                : requestedCode;
+            return requestedCode;
         }
 
         public void Reset(F7bsdFan fan) => ResetCalls.Add(fan);

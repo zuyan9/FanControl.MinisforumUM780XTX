@@ -4,13 +4,7 @@ internal sealed record F7bsdTelemetry(
     int CpuFanRpm,
     int SystemFanRpm,
     int CpuTemperatureC,
-    int SystemTemperatureC,
-    byte CpuTargetCode,
-    byte SystemTargetCode,
-    byte CpuEffectiveTemperatureC,
-    byte SystemEffectiveTemperatureC,
-    byte CpuTemperatureOverride,
-    byte SystemTemperatureOverride);
+    int SystemTemperatureC);
 
 internal static class F7bsdTelemetryDecoder
 {
@@ -35,13 +29,7 @@ internal static class F7bsdTelemetryDecoder
             CounterToRpm(cpuCounter),
             CounterToRpm(systemCounter),
             values[6],
-            values[7],
-            values[8],
-            values[9],
-            values[10],
-            values[11],
-            values[12],
-            values[13]);
+            values[7]);
         return true;
     }
 
