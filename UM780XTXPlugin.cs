@@ -2,7 +2,7 @@ using FanControl.Plugins;
 
 namespace FanControl.MinisforumUM780XTX;
 
-/// <summary>Exposes the verified F7BSD fan telemetry and safe native policies.</summary>
+/// <summary>Exposes verified F7BSD fan telemetry and raw closed-loop targets.</summary>
 public sealed class UM780XTXPlugin : IPlugin2
 {
     private readonly Func<IF7bsdBackend> backendFactory;
@@ -51,7 +51,7 @@ public sealed class UM780XTXPlugin : IPlugin2
             lifecycleSync);
         systemControl = new ControlSensor(
             "minisforum.um780xtx.f7bsd.system-control",
-            "UM780 XTX System Fan Mode",
+            "UM780 XTX System Fan Control",
             $"{Name}/{systemFan.Id}",
             value => Set(F7bsdFan.System, value),
             () => Reset(F7bsdFan.System),
@@ -91,7 +91,7 @@ public sealed class UM780XTXPlugin : IPlugin2
             container.FanSensors.AddRange([cpuFan, systemFan]);
             container.TempSensors.AddRange([cpuTemperature, systemTemperature]);
             container.ControlSensors.AddRange([cpuControl, systemControl]);
-            Log("Minisforum UM780 XTX loaded CPU curve and system mode controls.");
+            Log("Minisforum UM780 XTX loaded raw CPU and system target controls.");
         }
     }
 
