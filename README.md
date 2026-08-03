@@ -9,6 +9,9 @@ machine's IT5571 embedded controller (EC) and exposes:
 - a CPU closed-loop target backed by a flat native seven-row curve; and
 - a system closed-loop target backed by the EC's fixed-target selector.
 
+<img width="400" alt="image" src="https://github.com/user-attachments/assets/6715b427-6425-4321-a3f6-5a8bae6a38e7" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/33ade8d4-c7ec-4bf6-839c-daf673d00b4e" />
+
 The plugin is deliberately specific to the hardware and firmware combination
 on which the register map was verified. It does not scan EC memory or attempt
 generic Minisforum support.
