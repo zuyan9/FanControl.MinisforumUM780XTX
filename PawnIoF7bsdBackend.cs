@@ -941,12 +941,12 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
                 "prefix of the issued transaction.");
         }
 
+        // Resume an interrupted B1 recovery by its exact suffix. For an
+        // interrupted control mutation, the observed table was certified above;
+        // plan directly from that prefix to B1 instead of reversing old writes.
         F7bsdCpuTransitionStep[] recovery = cpuRecoveryPlanEndsAtB1
             ? issuedPlan[completedStepCount..]
-            : F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(
-                source,
-                issuedPlan,
-                current);
+            : F7bsdCpuPolicy.PlanTransitionToB1(current);
         if (recovery.Length == 0)
         {
             throw new IOException(
@@ -1099,10 +1099,14 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
 
     private F7bsdTelemetry ReadStableTelemetry(IF7bsdTransport active)
     {
+        bool superviseSystem = systemMayBeOwned;
+        ushort[] addresses = superviseSystem
+            ? F7bsdProfile.RuntimeTelemetryAddresses
+            : F7bsdProfile.TelemetryAddresses;
         byte[] sample;
         try
         {
-            sample = active.Read(F7bsdProfile.RuntimeTelemetryAddresses);
+            sample = active.Read(addresses);
         }
         catch (Exception failure)
         {
@@ -1114,7 +1118,7 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             throw;
         }
 
-        if (systemMayBeOwned)
+        if (superviseSystem)
         {
             sample = ReplaceSystemState(sample, GuardSystem(
                 active,
@@ -1135,7 +1139,7 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             systemRpm,
             sample[6],
             sample[7],
-            systemMayBeOwned ? systemAppliedCode : null);
+            superviseSystem ? systemAppliedCode : null);
     }
 
     private byte[] GuardSystem(IF7bsdTransport active, byte[] state)

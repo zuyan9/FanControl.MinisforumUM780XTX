@@ -13,7 +13,7 @@ internal readonly record struct F7bsdCpuPolicyRow(
     internal F7bsdCpuRowState State => new(Base, Slope);
 }
 
-/// <summary>A single-byte step in a crash-safe normal-row transition.</summary>
+/// <summary>A single-byte step in a transition-bounded normal-row update.</summary>
 internal readonly record struct F7bsdCpuTransitionStep(
     int RowIndex,
     EcWrite Write,
@@ -34,8 +34,6 @@ internal static class F7bsdCpuPolicy
     internal const int MaximumWritesPerRow = DirectMaximumWritesPerRow * 2;
     internal const int MaximumWritesPerTransition =
         NormalRowCount * MaximumWritesPerRow;
-    internal const int MaximumCertifiedRecoveryWrites =
-        MaximumWritesPerTransition * 2;
     internal const int CriticalTemperatureC = 94;
 
     private const int SlopeValueCount = 0x100;
@@ -224,11 +222,11 @@ internal static class F7bsdCpuPolicy
     }
 
     /// <summary>
-    /// Returns the absolute floor accepted for a crash-stable intermediate.
+    /// Returns the absolute floor accepted for a transition intermediate.
     /// Exact B1 is trusted, while generated endpoints dominate the stronger
     /// thermal envelope; their pointwise minimum is safe for transitions.
     /// </summary>
-    internal static int CrashFloorAt(int rowIndex, int temperatureC)
+    internal static int TransitionFloorAt(int rowIndex, int temperatureC)
     {
         AssertNormalRowIndex(rowIndex);
         return Math.Min(
@@ -264,10 +262,10 @@ internal static class F7bsdCpuPolicy
     }
 
     /// <summary>
-    /// Tests whether a row is suitable as an indefinitely retained transition
-    /// prefix under the conservative B1-or-thermal crash floor.
+    /// Tests whether a row remains within the conservative B1-or-thermal
+    /// transition floor and code-51 ceiling.
     /// </summary>
-    internal static bool IsCrashSafe(int rowIndex, F7bsdCpuRowState state)
+    internal static bool IsTransitionBounded(int rowIndex, F7bsdCpuRowState state)
     {
         AssertNormalRowIndex(rowIndex);
         F7bsdCpuPolicyRow band = BalancedRows[rowIndex];
@@ -276,7 +274,7 @@ internal static class F7bsdCpuPolicy
             temperature++)
         {
             int target = TargetAt(rowIndex, state, temperature);
-            if (target < CrashFloorAt(rowIndex, temperature) ||
+            if (target < TransitionFloorAt(rowIndex, temperature) ||
                 target > F7bsdProfile.MaximumCode)
             {
                 return false;
@@ -296,16 +294,16 @@ internal static class F7bsdCpuPolicy
         F7bsdCpuRowState to)
     {
         AssertNormalRowIndex(rowIndex);
-        if (!IsCrashSafe(rowIndex, from))
+        if (!IsTransitionBounded(rowIndex, from))
         {
             throw new ArgumentException(
-                $"CPU row {rowIndex} start state is not crash-safe.",
+                $"CPU row {rowIndex} start state is outside transition bounds.",
                 nameof(from));
         }
-        if (!IsCrashSafe(rowIndex, to))
+        if (!IsTransitionBounded(rowIndex, to))
         {
             throw new ArgumentException(
-                $"CPU row {rowIndex} destination state is not crash-safe.",
+                $"CPU row {rowIndex} destination state is outside transition bounds.",
                 nameof(to));
         }
         if (from == to)
@@ -349,7 +347,8 @@ internal static class F7bsdCpuPolicy
     {
         AssertNormalRowIndex(rowIndex);
         path = [];
-        if (!IsCrashSafe(rowIndex, from) || !IsCrashSafe(rowIndex, to))
+        if (!IsTransitionBounded(rowIndex, from) ||
+            !IsTransitionBounded(rowIndex, to))
         {
             return false;
         }
@@ -437,7 +436,8 @@ internal static class F7bsdCpuPolicy
 
     /// <summary>
     /// Plans all seven rows and emits concrete one-byte EC writes. Completing
-    /// one crash-safe row before the next keeps every full-table prefix safe.
+    /// one transition-bounded row before the next keeps every selectable row
+    /// within the transition floor and code-51 ceiling.
     /// </summary>
     internal static F7bsdCpuTransitionStep[] PlanTransition(
         ReadOnlySpan<F7bsdCpuRowState> from,
@@ -479,27 +479,6 @@ internal static class F7bsdCpuPolicy
             GetB1MutableStates());
 
     /// <summary>
-    /// Returns true when a table is exact B1 or one of the 52 compiled control
-    /// endpoints. This intentionally does not bless arbitrary safe-looking RAM.
-    /// </summary>
-    internal static bool IsKnownControlTable(ReadOnlySpan<F7bsdCpuRowState> states)
-    {
-        AssertTableLength(states, nameof(states));
-        if (states.SequenceEqual(GetB1MutableStates()))
-        {
-            return true;
-        }
-        foreach (F7bsdCpuRowState[] target in CompiledTargets)
-        {
-            if (states.SequenceEqual(target))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// <summary>
     /// Materializes an exact full-table prefix of a deterministic issued plan.
     /// Invalid or internally inconsistent plans are rejected.
     /// </summary>
@@ -509,7 +488,7 @@ internal static class F7bsdCpuPolicy
         int completedStepCount)
     {
         AssertTableLength(source, nameof(source));
-        AssertCertifiedPlanLength(issuedPlan);
+        AssertIssuedPlanLength(issuedPlan);
         if (completedStepCount < 0 || completedStepCount > issuedPlan.Length)
         {
             throw new ArgumentOutOfRangeException(nameof(completedStepCount));
@@ -525,8 +504,8 @@ internal static class F7bsdCpuPolicy
 
     /// <summary>
     /// Matches an observed table only against exact prefixes of the issued
-    /// plan. The first exact prefix count is returned; arbitrary crash-safe
-    /// states are deliberately not accepted for recovery.
+    /// plan. The first exact prefix count is returned; arbitrary
+    /// transition-bounded states are deliberately not accepted for recovery.
     /// </summary>
     internal static bool TryMatchTransitionPrefix(
         ReadOnlySpan<F7bsdCpuRowState> source,
@@ -536,7 +515,7 @@ internal static class F7bsdCpuPolicy
     {
         AssertTableLength(source, nameof(source));
         AssertTableLength(observed, nameof(observed));
-        AssertCertifiedPlanLength(issuedPlan);
+        AssertIssuedPlanLength(issuedPlan);
         F7bsdCpuRowState[] states = source.ToArray();
         if (states.AsSpan().SequenceEqual(observed))
         {
@@ -556,73 +535,6 @@ internal static class F7bsdCpuPolicy
 
         completedStepCount = -1;
         return false;
-    }
-
-    /// <summary>
-    /// Builds a recovery plan for exact B1 or a certified issued-plan prefix.
-    /// It reverses the applied prefix exactly, then restores the known source
-    /// endpoint to exact B1 through the normal bounded planner.
-    /// </summary>
-    internal static F7bsdCpuTransitionStep[] PlanCertifiedRecoveryToB1(
-        ReadOnlySpan<F7bsdCpuRowState> source,
-        ReadOnlySpan<F7bsdCpuTransitionStep> issuedPlan,
-        ReadOnlySpan<F7bsdCpuRowState> observed)
-    {
-        AssertTableLength(source, nameof(source));
-        AssertTableLength(observed, nameof(observed));
-        AssertIssuedPlanLength(issuedPlan);
-        if (!IsKnownControlTable(source))
-        {
-            throw new ArgumentException(
-                "Certified recovery requires an exact known source table.",
-                nameof(source));
-        }
-        if (observed.SequenceEqual(GetB1MutableStates()))
-        {
-            return [];
-        }
-        if (!TryMatchTransitionPrefix(
-            source,
-            issuedPlan,
-            observed,
-            out int completedStepCount))
-        {
-            throw new InvalidOperationException(
-                "The observed CPU table is not an exact prefix of the issued plan.");
-        }
-
-        F7bsdCpuRowState[] replay = source.ToArray();
-        F7bsdCpuRowState[] priorStates = new F7bsdCpuRowState[completedStepCount];
-        for (int index = 0; index < completedStepCount; index++)
-        {
-            int row = issuedPlan[index].RowIndex;
-            AssertNormalRowIndex(row);
-            priorStates[index] = replay[row];
-            ApplyTransitionStep(replay, issuedPlan[index]);
-        }
-
-        List<F7bsdCpuTransitionStep> recovery = [];
-        for (int index = completedStepCount - 1; index >= 0; index--)
-        {
-            int row = issuedPlan[index].RowIndex;
-            F7bsdCpuRowState previous = priorStates[index];
-            recovery.Add(CreateTransitionStep(row, replay[row], previous));
-            replay[row] = previous;
-        }
-        if (!replay.AsSpan().SequenceEqual(source))
-        {
-            throw new InvalidOperationException(
-                "The issued CPU transition did not reverse to its source table.");
-        }
-
-        recovery.AddRange(PlanTransitionToB1(source));
-        if (recovery.Count > MaximumCertifiedRecoveryWrites)
-        {
-            throw new InvalidOperationException(
-                $"Certified CPU recovery exceeded " +
-                $"{MaximumCertifiedRecoveryWrites} writes.");
-        }
-        return recovery.ToArray();
     }
 
     private static F7bsdCpuRowState[][] BuildCompiledTargets()
@@ -889,10 +801,11 @@ internal static class F7bsdCpuPolicy
             throw new InvalidOperationException(
                 "A CPU transition edge did not change exactly one byte.");
         }
-        if (!IsCrashSafe(rowIndex, to))
+        if (!IsTransitionBounded(rowIndex, to))
         {
             throw new InvalidOperationException(
-                $"CPU transition row {rowIndex} produced an unsafe prefix.");
+                $"CPU transition row {rowIndex} produced a prefix outside " +
+                "transition bounds.");
         }
         return new(rowIndex, write, to);
     }
@@ -971,15 +884,4 @@ internal static class F7bsdCpuPolicy
         }
     }
 
-    private static void AssertCertifiedPlanLength(
-        ReadOnlySpan<F7bsdCpuTransitionStep> issuedPlan)
-    {
-        if (issuedPlan.Length > MaximumCertifiedRecoveryWrites)
-        {
-            throw new ArgumentException(
-                $"A certified CPU recovery may contain at most " +
-                $"{MaximumCertifiedRecoveryWrites} writes.",
-                nameof(issuedPlan));
-        }
-    }
 }
