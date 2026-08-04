@@ -23,9 +23,12 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         Faulted,
     }
 
-    private const int OwnershipPollAttempts = 6;
-    private static readonly TimeSpan OwnershipPollDelay = TimeSpan.FromMilliseconds(100);
-    private static readonly TimeSpan ReleasePollDelay = TimeSpan.FromMilliseconds(100);
+    // Fifteen 100 ms sleeps cover the firmware selector's observed service
+    // interval while keeping each wait finite. Only the effective-temperature
+    // byte is polled; one full state read verifies the final handoff.
+    private const int SystemSelectorPollAttempts = 16;
+    private static readonly TimeSpan SystemSelectorPollDelay =
+        TimeSpan.FromMilliseconds(100);
     private static readonly TimeSpan CpuMutationMinimumInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan SystemGuardMaximumGap = TimeSpan.FromSeconds(4);
     private readonly object sync = new();
@@ -218,11 +221,11 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         lock (sync)
         {
             IF7bsdTransport active = ActiveTransport();
-            if (systemState == SystemControlState.Faulted)
+            if (systemState == SystemControlState.Faulted && systemMayBeOwned)
             {
                 throw new InvalidOperationException(
-                    "A system-control transaction faulted. Refresh the plugin after " +
-                    "verified release or restart Windows before applying controls.");
+                    "System ownership cleanup is pending. Only Reset or Close may " +
+                    "retry the bounded release transaction.");
             }
             return fan switch
             {
@@ -810,40 +813,66 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
 
     private byte[] WaitForSystemOwnership(IF7bsdTransport active)
     {
-        for (int attempt = 0; attempt < OwnershipPollAttempts; attempt++)
+        byte lastEffective = 0;
+        for (int attempt = 0; attempt < SystemSelectorPollAttempts; attempt++)
         {
-            byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
-            if (state[2] == F7bsdProfile.SystemSentinel &&
-                state[1] == F7bsdProfile.SystemSentinel)
+            lastEffective = active.Read(
+                F7bsdProfile.SystemEffectiveTemperaturePollAddresses)[0];
+            if (lastEffective == F7bsdProfile.SystemSentinel)
             {
-                return state;
+                break;
             }
-            if (attempt + 1 < OwnershipPollAttempts)
+            if (attempt + 1 < SystemSelectorPollAttempts)
             {
-                sleeper(OwnershipPollDelay);
+                sleeper(SystemSelectorPollDelay);
             }
         }
 
-        throw new IOException("Firmware did not enter system fixed-target ownership.");
+        byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
+        if (state[2] == F7bsdProfile.SystemSentinel &&
+            state[1] == F7bsdProfile.SystemSentinel)
+        {
+            return state;
+        }
+        throw new IOException(
+            "Firmware did not enter system fixed-target ownership after the " +
+            $"bounded selector wait; last effective byte was 0x{lastEffective:X2}, " +
+            $"final state was {DescribeSystemState(state)}.");
     }
 
     private byte[] WaitForSystemRelease(IF7bsdTransport active)
     {
-        for (int attempt = 0; attempt < OwnershipPollAttempts; attempt++)
+        byte lastEffective = F7bsdProfile.SystemSentinel;
+        for (int attempt = 0; attempt < SystemSelectorPollAttempts; attempt++)
         {
-            byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
-            if (HealthyFirmwareSystemState(state))
+            lastEffective = active.Read(
+                F7bsdProfile.SystemEffectiveTemperaturePollAddresses)[0];
+            if (F7bsdProfile.PlausibleTemperature(lastEffective))
             {
-                return state;
+                break;
             }
-            if (attempt + 1 < OwnershipPollAttempts)
+            if (attempt + 1 < SystemSelectorPollAttempts)
             {
-                sleeper(ReleasePollDelay);
+                sleeper(SystemSelectorPollDelay);
             }
         }
 
-        throw new IOException("Firmware did not resume live system-temperature ownership.");
+        byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
+        if (HealthyFirmwareSystemState(state))
+        {
+            return state;
+        }
+        throw new IOException(
+            "Firmware did not resume live system-temperature ownership after the " +
+            $"bounded selector wait; last effective byte was 0x{lastEffective:X2}, " +
+            $"final state was {DescribeSystemState(state)}.");
     }
+
+    private static string DescribeSystemState(ReadOnlySpan<byte> state) =>
+        state.Length == F7bsdProfile.SystemOwnershipAddresses.Length
+            ? $"raw=0x{state[0]:X2}, effective=0x{state[1]:X2}, " +
+                $"override=0x{state[2]:X2}, target=0x{state[3]:X2}"
+            : $"an unexpected {state.Length}-byte snapshot";
 
     private static bool HealthyFirmwareSystemState(ReadOnlySpan<byte> state) =>
         state.Length == F7bsdProfile.SystemOwnershipAddresses.Length &&

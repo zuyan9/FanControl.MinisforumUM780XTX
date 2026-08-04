@@ -116,6 +116,8 @@ internal static class F7bsdProfile
         SystemTemperatureOverrideAddress,
         SystemTargetAddress,
     ];
+    internal static readonly ushort[] SystemEffectiveTemperaturePollAddresses =
+        [SystemEffectiveTemperatureAddress];
     internal static readonly ushort[] StartupStateAddresses =
     [
         .. CpuSafetyStateAddresses,

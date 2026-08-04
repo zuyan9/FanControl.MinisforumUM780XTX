@@ -58,6 +58,7 @@ internal static class Program
             ("CPU restore refuses immutable profile drift", CpuRestoreIgnoresMutableConfiguration),
             ("system ownership lifecycle", SystemOwnershipLifecycle),
             ("system ownership polling is bounded", SystemOwnershipPollingIsBounded),
+            ("verified system faults do not poison CPU control", VerifiedSystemFaultDoesNotPoisonCpu),
             ("unsafe initial system temperature only allows full", UnsafeInitialSystemTemperatureOnlyAllowsFull),
             ("system release failures are bounded and recoverable", SystemReleaseFailurePaths),
             ("system thermal guard precedes tach retries", SystemThermalGuardPrecedesTachRetries),
@@ -1048,19 +1049,23 @@ internal static class Program
     private static void SystemOwnershipPollingIsBounded()
     {
         FakeClock delayedClock = new();
-        FakeTransport delayed = new() { OwnershipReadsBeforeEffective = 5 };
+        FakeTransport delayed = new() { OwnershipReadsBeforeEffective = 15 };
         PawnIoF7bsdBackend delayedBackend = CreateBackend(delayed, delayedClock);
         delayedBackend.Initialize();
         Equal((byte)22, delayedBackend.Set(F7bsdFan.System, 22));
-        Equal(6, delayed.OwnershipPollReads);
-        Equal(5, delayedClock.Sleeps.Count);
+        Equal(16, delayed.OwnershipPollReads);
+        Equal(15, delayedClock.Sleeps.Count);
         True(delayedClock.Sleeps.All(delay => delay == TimeSpan.FromMilliseconds(100)));
-        delayed.ReleaseReadsBeforeEffective = 5;
+        delayed.ReleaseReadsBeforeEffective = 15;
         delayedBackend.Reset(F7bsdFan.System);
-        Equal(6, delayed.ReleasePollReads);
-        Equal(10, delayedClock.Sleeps.Count);
-        True(delayedClock.Sleeps.Skip(5).All(delay =>
+        Equal(16, delayed.ReleasePollReads);
+        Equal(30, delayedClock.Sleeps.Count);
+        True(delayedClock.Sleeps.Skip(15).All(delay =>
             delay == TimeSpan.FromMilliseconds(100)));
+        True(delayed.ReadBatches
+            .Where(addresses => addresses.Length == 1 &&
+                addresses[0] == F7bsdProfile.SystemEffectiveTemperatureAddress)
+            .Count() >= 32);
         delayedBackend.Dispose();
 
         FakeClock timeoutClock = new();
@@ -1068,9 +1073,10 @@ internal static class Program
         PawnIoF7bsdBackend timeoutBackend = CreateBackend(timeout, timeoutClock);
         timeoutBackend.Initialize();
         ThrowsAny<Exception>(() => timeoutBackend.Set(F7bsdFan.System, 20));
-        // Six bounded ownership polls plus one cleanup snapshot after timeout.
-        Equal(7, timeout.OwnershipPollReads);
-        Equal(5, timeoutClock.Sleeps.Count);
+        // Sixteen effective-byte polls, one final state read, and one cleanup
+        // snapshot occur before the verified release.
+        Equal(18, timeout.OwnershipPollReads);
+        Equal(15, timeoutClock.Sleeps.Count);
         Equal((byte)51, timeout.ByteAt(0x0885));
         Equal((byte)0, timeout.ByteAt(0x088b));
         int reads = timeout.ReadBatches.Count;
@@ -1079,6 +1085,29 @@ internal static class Program
         Equal(reads, timeout.ReadBatches.Count);
         Equal(writes, timeout.WriteBatches.Count);
         timeoutBackend.Dispose();
+    }
+
+    private static void VerifiedSystemFaultDoesNotPoisonCpu()
+    {
+        FakeClock clock = new();
+        FakeTransport transport = new() { AutoSystemOwnership = false };
+        byte[] baseline = transport.CpuBytes();
+        PawnIoF7bsdBackend backend = CreateBackend(transport, clock);
+        backend.Initialize();
+
+        Equal((byte)10, backend.Set(F7bsdFan.Cpu, 10));
+        AssertCpuPolicy(transport, 10);
+        ThrowsAny<Exception>(() => backend.Set(F7bsdFan.System, 30));
+        Equal((byte)0, transport.ByteAt(0x088b));
+        Equal<byte?>((byte)10, backend.ReadTelemetry().CpuAppliedCode);
+
+        clock.Advance(TimeSpan.FromSeconds(1));
+        Equal((byte)18, backend.Set(F7bsdFan.Cpu, 18));
+        AssertCpuPolicy(transport, 18);
+        Throws<InvalidOperationException>(() => backend.Set(F7bsdFan.System, 30));
+
+        backend.Dispose();
+        SequenceEqual(baseline, transport.CpuBytes());
     }
 
     private static void UnsafeInitialSystemTemperatureOnlyAllowsFull()
@@ -1183,6 +1212,9 @@ internal static class Program
         reads = staleEffective.ReadBatches.Count;
         writes = staleEffective.WriteBatches.Count;
         Throws<InvalidOperationException>(() => staleBackend.ReadTelemetry());
+        Equal(reads, staleEffective.ReadBatches.Count);
+        Equal(writes, staleEffective.WriteBatches.Count);
+        Throws<InvalidOperationException>(() => staleBackend.Set(F7bsdFan.Cpu, 18));
         Equal(reads, staleEffective.ReadBatches.Count);
         Equal(writes, staleEffective.WriteBatches.Count);
         Throws<InvalidOperationException>(() => staleBackend.Set(F7bsdFan.System, 51));
@@ -2480,7 +2512,7 @@ internal static class Program
                 throw new IOException($"Expected fake read failure {readCalls}.");
             }
 
-            if (addresses.SequenceEqual(F7bsdProfile.SystemOwnershipAddresses) &&
+            if (IsSystemSelectorPoll(addresses) &&
                 ByteAt(F7bsdProfile.SystemTemperatureOverrideAddress) ==
                     F7bsdProfile.SystemSentinel &&
                 ByteAt(F7bsdProfile.SystemEffectiveTemperatureAddress) !=
@@ -2501,7 +2533,7 @@ internal static class Program
                     }
                 }
             }
-            if (addresses.SequenceEqual(F7bsdProfile.SystemOwnershipAddresses) &&
+            if (IsSystemSelectorPoll(addresses) &&
                 ByteAt(F7bsdProfile.SystemTemperatureOverrideAddress) == 0 &&
                 ByteAt(F7bsdProfile.SystemEffectiveTemperatureAddress) ==
                     F7bsdProfile.SystemSentinel &&
@@ -2635,6 +2667,11 @@ internal static class Program
         internal byte ByteAt(ushort address) => memory.TryGetValue(address, out byte value)
             ? value
             : (byte)0;
+
+        private static bool IsSystemSelectorPoll(ReadOnlySpan<ushort> addresses) =>
+            addresses.SequenceEqual(F7bsdProfile.SystemOwnershipAddresses) ||
+            addresses.SequenceEqual(
+                F7bsdProfile.SystemEffectiveTemperaturePollAddresses);
 
         internal void SetByte(ushort address, byte value) => memory[address] = value;
 

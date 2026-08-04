@@ -82,8 +82,8 @@ curves, hysteresis, mixing, minimum-running-speed, and start/stop policy.
 
 The narrow user-mode guard does not replace Fan Control's policy:
 
-- engagement and release use at most six polls, with no sleep after the final
-  poll;
+- engagement and release allow the firmware selector up to 1.5 seconds, poll
+  only its effective-temperature byte, and finish with one full state read;
 - raw system temperature comes from `0x0305`, never from the sentinel-backed
   effective byte;
 - firmware-owned telemetry omits the three system-ownership-only bytes; they
@@ -143,13 +143,15 @@ is consistent with a GPU/display timeout but does not identify the initiating
 cause. The available evidence neither proved that the plugin caused the freezes
 nor excluded raw EC traffic provoking an EC/firmware deadlock.
 
-The v3 CPU policy has now passed the attended stages described below on this
-exact machine. Those short stages reduce uncertainty; they do not prove that
-generic user-mode EC traffic can never deadlock firmware or that an unrelated
-GPU/platform fault cannot recur. Save work and test attended. Live system code
-`0`, an induced 70 C system-fan trip, forced termination, OS crash,
-sleep/resume, multi-hour operation, and sustained high-temperature CPU-tail
-operation have not been exercised on Windows.
+Version 3.0.1 has now passed attended CPU-only, system-only, combined, real
+curve, CPU-load, and display-load stages on this exact machine. The campaign
+also exposed and corrected the false system-selector timeout described below.
+These tests reduce uncertainty; they do not prove that generic user-mode EC
+traffic can never deadlock firmware or that an unrelated GPU/platform fault
+cannot recur. Save work and test attended. Live system code `0`, an actual 70 C
+system-fan trip, forced termination, OS crash, sleep/resume, multi-hour
+operation, and sustained high-temperature CPU-tail operation have not been
+exercised on Windows.
 
 The extracted BIOS 1.06 EC image and the firmware routines behind both controls
 are documented in [UM780 XTX EC firmware analysis](docs/EC_FIRMWARE_ANALYSIS.md).
@@ -174,57 +176,61 @@ dotnet build -c Release `
   "-p:FanControlDir=C:\path\to\FanControl_272_net_10_0"
 ```
 
-The 46-test offline suite checks every v3 CPU request over both thermal paths, all
+The offline suite checks every v3 CPU request over both thermal paths, all
 `52 x 52 x 7` compiled-policy transitions, one-second mutation coalescing,
 zero-I/O equivalent requests, interruption of both the original write and its
 direct exact-prefix recovery, non-prefix rejection, exact B1 reset, EC address
 allowlists, parking and poisoning behavior, bounded system ownership/release,
-thermal and timing boundaries, drift, cleanup retry, telemetry ordering, and
-plugin exception containment.
+cross-fan fault isolation, thermal and timing boundaries, drift, cleanup retry,
+telemetry ordering, and plugin exception containment.
 
 ## Hardware validation status
 
-The prior CPU-minimum-v2/system-raw-v2 staged build was exercised on the exact
-UM780 XTX profile above:
+Version 3.0.1 was tested inside the actual Fan Control V272 executable on the
+exact UM780 XTX profile above. The campaign discovered a genuine defect in the
+previous build: a 500 ms system-selector wait could report a false timeout
+while the EC remained responsive, and the resulting shared fault gate could
+also disable CPU control after a verified system release.
 
-- repeated read-only identity, profile, telemetry, and stock-state audits;
-- CPU floor codes `0`, `28`, and `29`, including `28 -> 29 -> 28` and a
-  30-second code-28 hold;
-- system raw code `51` and code `30` for 10 seconds each;
-- the plugin API/control-sensor harness at CPU code `28` and system code `30`;
-  and
-- that same harness with both controls together at CPU code `28` and system
-  code `30`.
+Version 3.0.1 allows the selector up to 1.5 seconds, polls only its
+effective-temperature byte, performs one final full-state verification, and
+keeps CPU control independent unless system cleanup is genuinely pending. A
+direct live-hardware A/B produced one false release timeout in 12 cycles before
+the fix and none in 12 cycles afterward; all 24 following stock audits passed.
 
-Every completed stage was followed by an independent stock-state audit. The
-combined runs held CPU at 57-70 C and system at 51-52 C; no WHEA, display-reset,
-Kernel-Power, relevant application-crash, or new dump event appeared in the
-validation window. This is validation evidence, not a guarantee against every
-firmware or operating-system failure.
+The post-fix build then completed, through Fan Control itself:
 
-The `cpu-native-v3` build was then validated CPU-only, with the system fan left
-firmware-owned throughout:
+- 10 CPU-first and five system-first fresh combined engagements and releases;
+- 180 seconds of `CPU 10 / system 30` all-core load, with both controls exact
+  in all 200 monitored hold samples;
+- 40 rapid combined-transition stages, including 120 seconds of overlapping
+  all-core load;
+- manual CPU codes 18, 14, and 10 and system codes 51, 30, 25, 20, 15, and 10;
+- 60-second CPU-only and system-code-10 load stages;
+- a completed 360-sample real graph-curve run with 240 seconds of all-core
+  load; and
+- valid 30-second windowed and 60-second fullscreen WinSAT DWM stages while
+  real curves and CPU load were active.
 
-- isolated native target codes `18`, `16`, `14`, `12`, and `10`, descending
-  from 1800 to 1000 RPM requests, with a fresh exact-B1 audit after every run;
-- `18 -> 16 -> 14 -> 12 -> 10 -> 12 -> 18` transitions at five-second
-  intervals;
-- rapid plugin callback changes in both directions, confirming that each burst
-  coalesced to its final endpoint after the one-second quiet interval;
-- a 120-second static code-10 soak, settling around 995-1077 RPM at 61-69 C;
-  and
-- a delayed final exact-B1 audit, which observed the CPU fan back at 2563 RPM.
+The curve-only run exercised 13 confirmed CPU control levels and two system
+levels. Two mixed stages stopped exactly at configured 65 C and 69 C system
+limits; Fan Control stayed responsive and both controls were verified null
+afterward. A five-second cooperative ISA-mutex hold with safe controls active
+also produced the expected bounded fault, then recovered through disable and
+refresh.
 
-The system fan stayed under firmware control around 2053-2073 RPM while its raw
-temperature remained 53-57 C. CPU mutation transactions completed in roughly
-29-32 ms. Every stock restoration and post-stage audit passed, with no new
-WHEA, display-reset, Kernel-Power, relevant Windows Error Reporting, or
-LiveKernelReport evidence in either validation window. These are short
-functional and stability checks, not a guarantee against a rare firmware or
-platform failure during longer real-world use. The callback-coalescing stage
-used the real plugin and hardware backend inside the diagnostic host; the saved
-curve has not yet been enabled in the Fan Control executable for a long-running
-session.
+No whole-machine freeze or black-screen incident occurred. All 41 independent
+stock audits passed. The final event/dump query found no new WHEA, display
+reset, BugCheck, Kernel-Power, relevant application error, LiveKernelEvent, or
+dump in the curve/display/fault-test window.
+
+The complete matrix, expected thermal stops, excluded pilot runs, final state,
+and residual risks are recorded in the
+[real Fan Control hardware campaign](diagnostics/hardware-results/2026-08-04-real-fan-control/CAMPAIGN.md).
+These tests materially reduce uncertainty but do not prove that a rare
+firmware, raw indexed-port, GPU, or platform failure cannot recur. A 24-72 hour
+representative-use soak, sleep/resume, forced termination, live system code 0,
+and an actual system thermal-failsafe trip remain untested.
 
 ## Recovery and user-mode limit
 

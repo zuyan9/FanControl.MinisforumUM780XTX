@@ -11,6 +11,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="CpuBurn\**\*.cs" />
+    <Compile Remove="FanControlIpc\**\*.cs" />
+    <Compile Remove="IsaMutexFault\**\*.cs" />
     <ProjectReference Include="..\FanControl.MinisforumUM780XTX.csproj" />
     <Reference Include="FanControl.Plugins">
       <HintPath>$(FanControlDir)\FanControl.Plugins.dll</HintPath>

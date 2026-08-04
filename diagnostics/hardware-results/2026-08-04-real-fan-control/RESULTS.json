@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-08-04",
+  "machine": {
+    "model": "Minisforum UM780 XTX",
+    "board": "F7BSD 1.1",
+    "bios": "1.06",
+    "ec": "0.8",
+    "os": "Windows 11 x64",
+    "fanControl": "V272",
+    "pawnIo": "2.2.0"
+  },
+  "plugin": {
+    "version": "3.0.1.0",
+    "lengthBytes": 87040,
+    "sha256": "9E46A71AD017D34ABE9B6C6C3CE210CD4928F97D429E18197F6FEBD689D8F6EA"
+  },
+  "rootCause": {
+    "classification": "responsive EC false selector timeout plus cross-fan fault propagation",
+    "oldSelectorLimitMilliseconds": 500,
+    "newSelectorLimitMilliseconds": 1500,
+    "oldWorstCaseSelectorReadBytes": 24,
+    "newWorstCaseSelectorReadBytes": 20
+  },
+  "offlineTests": {
+    "passed": 47,
+    "total": 47
+  },
+  "ownershipAB": {
+    "beforeFixPasses": 11,
+    "beforeFixAttempts": 12,
+    "afterFixPasses": 12,
+    "afterFixAttempts": 12,
+    "followingStockAuditPasses": 24,
+    "followingStockAuditAttempts": 24
+  },
+  "fanControl": {
+    "disabledTelemetrySamples": 180,
+    "sequentialRefreshPasses": 10,
+    "sequentialRefreshAttempts": 10,
+    "freshCpuFirstCombinedPasses": 10,
+    "freshCpuFirstCombinedAttempts": 10,
+    "freshSystemFirstCombinedPasses": 5,
+    "freshSystemFirstCombinedAttempts": 5,
+    "rapidTransitionStages": 40,
+    "combinedLoadSeconds": 180,
+    "combinedLoadMonitoredSamples": 200
+  },
+  "curveOnly": {
+    "status": "PASS",
+    "monitoredSamples": 360,
+    "monitoredSeconds": 435.14,
+    "cpuLoadSeconds": 240,
+    "fanControlUnresponsiveSamples": 0,
+    "missingTelemetrySamples": 0,
+    "missingControlSamples": 0,
+    "cpuTemperatureC": { "minimum": 67, "maximum": 87 },
+    "systemTemperatureC": { "minimum": 60, "maximum": 68 },
+    "cpuRpm": { "minimum": 943, "maximum": 3963 },
+    "systemRpm": { "minimum": 927, "maximum": 1526 },
+    "cpuControlPercent": { "minimum": 21.568628, "maximum": 47.058823, "uniqueLevels": 13 },
+    "systemControlPercent": { "minimum": 21.568628, "maximum": 23.529411, "uniqueLevels": 2 },
+    "finalControlsNull": true
+  },
+  "display": {
+    "windowedDwm": {
+      "status": "PASS",
+      "durationSeconds": 30.05,
+      "framesPerSecond": 306.20,
+      "videoMemoryMegabytesPerSecond": 26596.25
+    },
+    "fullscreenDwm": {
+      "status": "PASS",
+      "durationSeconds": 60.02,
+      "framesRendered": 12874,
+      "framesPerSecond": 214.48,
+      "videoMemoryMegabytesPerSecond": 34473.86
+    },
+    "observedBlackScreen": false,
+    "observedFreeze": false
+  },
+  "activeMutexRecovery": {
+    "status": "PASS",
+    "holdSeconds": 5,
+    "safeCpuCode": 18,
+    "safeSystemCode": 51,
+    "fanControlRemainedResponsive": true,
+    "finalControlsNull": true
+  },
+  "stockAudits": {
+    "passed": 41,
+    "total": 41,
+    "finalCpuTemperatureC": 70,
+    "finalCpuRpm": 3062,
+    "finalSystemTemperatureC": 58,
+    "finalSystemRpm": 2085
+  },
+  "finalEventDeltaFromLocalTime": "2026-08-04T03:00:00-07:00",
+  "newRelevantSystemEvents": 0,
+  "newRelevantApplicationEvents": 0,
+  "newDumpFiles": 0,
+  "finalFanControlRunning": false,
+  "originalUserConfigUnchanged": true,
+  "originalCacheRestored": true
+}
