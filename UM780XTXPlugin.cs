@@ -5,6 +5,11 @@ namespace FanControl.MinisforumUM780XTX;
 /// <summary>Exposes verified F7BSD fan telemetry and dual fan controls.</summary>
 public sealed class UM780XTXPlugin : IPlugin2
 {
+    internal const string CpuControlId =
+        "minisforum.um780xtx.f7bsd.cpu-cool-stop-v4";
+    internal const string SystemControlId =
+        "minisforum.um780xtx.f7bsd.system-raw-v2";
+
     private readonly Func<IF7bsdBackend> backendFactory;
     private readonly IPluginLogger? logger;
     private readonly object lifecycleSync = new();
@@ -45,8 +50,8 @@ public sealed class UM780XTXPlugin : IPlugin2
         this.backendFactory = backendFactory;
         this.logger = logger;
         cpuControl = new ControlSensor(
-            "minisforum.um780xtx.f7bsd.cpu-native-v3",
-            "UM780 XTX CPU Fan Target (EC Thermal Tail)",
+            CpuControlId,
+            "UM780 XTX CPU Fan Target (Cool-Stop Thermal Tail)",
             $"{Name}/{cpuFan.Id}",
             value => Set(F7bsdFan.Cpu, value),
             () => Reset(F7bsdFan.Cpu),
@@ -55,7 +60,7 @@ public sealed class UM780XTXPlugin : IPlugin2
                 exception.Message),
             lifecycleSync);
         systemControl = new ControlSensor(
-            "minisforum.um780xtx.f7bsd.system-raw-v2",
+            SystemControlId,
             "UM780 XTX System Fan Raw Target",
             $"{Name}/{systemFan.Id}",
             value => Set(F7bsdFan.System, value),
@@ -108,8 +113,8 @@ public sealed class UM780XTXPlugin : IPlugin2
             container.TempSensors.AddRange([cpuTemperature, systemTemperature]);
             container.ControlSensors.AddRange([cpuControl, systemControl]);
             Log(
-                "Minisforum UM780 XTX loaded native CPU-target and guarded raw " +
-                "system-fan controls.");
+                "Minisforum UM780 XTX loaded cool-stop CPU-target and guarded " +
+                "raw system-fan controls.");
         }
     }
 
@@ -129,16 +134,6 @@ public sealed class UM780XTXPlugin : IPlugin2
                     Apply(backend.ReadTelemetry());
                     consecutiveTelemetryFailures = 0;
                 }
-            }
-            catch (DeferredCpuControlException exception)
-            {
-                consecutiveTelemetryFailures = 0;
-                ClearTelemetry();
-                cpuControl.Fault();
-                Log(
-                    "Minisforum UM780 XTX deferred CPU control failed and was " +
-                    "disabled: " + (exception.InnerException?.Message ??
-                        exception.Message));
             }
             catch (Exception exception)
             {

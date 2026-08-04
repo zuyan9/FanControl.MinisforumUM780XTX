@@ -29,7 +29,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
     private const int SystemSelectorPollAttempts = 16;
     private static readonly TimeSpan SystemSelectorPollDelay =
         TimeSpan.FromMilliseconds(100);
-    private static readonly TimeSpan CpuMutationMinimumInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan SystemGuardMaximumGap = TimeSpan.FromSeconds(4);
     private readonly object sync = new();
     private readonly Func<HostIdentitySnapshot> hostReader;
@@ -44,9 +43,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
     private bool cpuRecoveryPlanEndsAtB1;
     private CpuControlState cpuState;
     private byte? cpuAppliedCode;
-    private byte? cpuPendingCode;
-    private long? lastCpuMutationTick;
-    private bool cpuMutationTimingFaulted;
     // Recovery latch: set before the sentinel write and retained until a
     // plausible firmware-owned temperature path is verified after release.
     private bool systemMayBeOwned;
@@ -137,9 +133,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
                 ClearCpuRecoveryCertificate();
                 cpuState = CpuControlState.Ready;
                 cpuAppliedCode = null;
-                cpuPendingCode = null;
-                lastCpuMutationTick = null;
-                cpuMutationTimingFaulted = false;
                 systemMayBeOwned = false;
                 systemState = SystemControlState.Firmware;
                 systemRequestedCode = null;
@@ -191,17 +184,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
                 throw;
             }
 
-            // CPU coalescing is deliberately outside the guarded-telemetry
-            // catch: a CPU transaction failure must not be counted as a
-            // system-fan telemetry failure.
-            try
-            {
-                TryApplyPendingCpu(active);
-            }
-            catch (Exception failure)
-            {
-                throw new DeferredCpuControlException(failure);
-            }
             return telemetry with
             {
                 CpuAppliedCode = cpuState == CpuControlState.Active
@@ -309,9 +291,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             ClearCpuRecoveryCertificate();
             cpuState = CpuControlState.Ready;
             cpuAppliedCode = null;
-            cpuPendingCode = null;
-            lastCpuMutationTick = null;
-            cpuMutationTimingFaulted = false;
             systemMayBeOwned = false;
             systemState = SystemControlState.Firmware;
             systemRequestedCode = null;
@@ -335,29 +314,13 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(requestedCode);
         if (current.SequenceEqual(target))
         {
-            cpuPendingCode = null;
             if (cpuState == CpuControlState.Active)
             {
-                // Codes 0..10 intentionally share the same physical table.
-                // Preserve the most recent confirmed semantic request without
-                // turning an equivalent request into EC traffic.
+                // Preserve the confirmed request without turning a duplicate
+                // target into EC traffic.
                 cpuAppliedCode = requestedCode;
             }
             return requestedCode;
-        }
-
-        if (cpuState == CpuControlState.Active)
-        {
-            byte appliedCode = cpuAppliedCode ?? throw new IOException(
-                "Active CPU control has no confirmed applied code.");
-            if (!CpuMutationIntervalElapsed())
-            {
-                // Retain only the latest request. The normal telemetry tick
-                // applies it after a full quiet second, even if Fan Control's
-                // setter is edge-triggered rather than repeated.
-                cpuPendingCode = requestedCode;
-                return appliedCode;
-            }
         }
 
         return ApplyCpuTarget(active, requestedCode, current, target);
@@ -374,7 +337,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             target);
         bool wasActive = cpuState == CpuControlState.Active;
         SetCpuRecoveryCertificate(current, steps, false, target);
-        cpuPendingCode = null;
         cpuState = CpuControlState.Active;
         bool writeAttempted = false;
         try
@@ -389,7 +351,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             cpuExpected = target;
             ClearCpuRecoveryCertificate();
             cpuAppliedCode = requestedCode;
-            RecordCpuMutationCompletion();
             return requestedCode;
         }
         catch (Exception failure)
@@ -401,9 +362,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
                 // exact startup B1 table is still authoritative.
                 ClearCpuRecoveryCertificate();
                 cpuAppliedCode = null;
-                cpuPendingCode = null;
-                lastCpuMutationTick = null;
-                cpuMutationTimingFaulted = false;
                 cpuState = CpuControlState.FaultedRestored;
                 throw;
             }
@@ -421,79 +379,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
                     cleanup);
             }
             throw;
-        }
-    }
-
-    private void TryApplyPendingCpu(IF7bsdTransport active)
-    {
-        if (cpuState != CpuControlState.Active ||
-            cpuPendingCode is not byte requestedCode ||
-            !CpuMutationIntervalElapsed())
-        {
-            return;
-        }
-
-        F7bsdCpuRowState[] current = ActiveCpuExpected();
-        F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(requestedCode);
-        if (current.SequenceEqual(target))
-        {
-            cpuPendingCode = null;
-            cpuAppliedCode = requestedCode;
-            return;
-        }
-        ApplyCpuTarget(active, requestedCode, current, target);
-    }
-
-    private bool CpuMutationIntervalElapsed()
-    {
-        if (cpuMutationTimingFaulted || lastCpuMutationTick is not long previous)
-        {
-            return false;
-        }
-
-        try
-        {
-            long current = timestamp();
-            if (current < previous)
-            {
-                cpuMutationTimingFaulted = true;
-                return false;
-            }
-            TimeSpan elapsed = elapsedTime(previous, current);
-            if (elapsed < TimeSpan.Zero)
-            {
-                cpuMutationTimingFaulted = true;
-                return false;
-            }
-            return elapsed >= CpuMutationMinimumInterval;
-        }
-        catch
-        {
-            cpuMutationTimingFaulted = true;
-            return false;
-        }
-    }
-
-    private void RecordCpuMutationCompletion()
-    {
-        try
-        {
-            long completed = timestamp();
-            if (lastCpuMutationTick is long previous && completed < previous)
-            {
-                cpuMutationTimingFaulted = true;
-                lastCpuMutationTick = null;
-                return;
-            }
-            lastCpuMutationTick = completed;
-            cpuMutationTimingFaulted = false;
-        }
-        catch
-        {
-            // Freeze the last confirmed table until Reset/Close if the
-            // monotonic clock becomes unavailable. Restoration is exempt.
-            cpuMutationTimingFaulted = true;
-            lastCpuMutationTick = null;
         }
     }
 
@@ -672,7 +557,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
 
     private void RestoreCpu(IF7bsdTransport active)
     {
-        cpuPendingCode = null;
         switch (cpuState)
         {
             case CpuControlState.Ready:
@@ -694,7 +578,8 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         SetCpuRecoveryCertificate(current, steps, true, baseline);
         try
         {
-            ValidateCpuSafetyState(active.Read(F7bsdProfile.CpuSafetyStateAddresses));
+            ValidateCpuRecoverySafetyState(
+                active.Read(F7bsdProfile.CpuSafetyStateAddresses));
             active.WriteGuarded(
                 BuildCpuExpectations(current),
                 steps.Select(step => step.Write).ToArray(),
@@ -704,9 +589,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             ClearCpuRecoveryCertificate();
             cpuState = CpuControlState.Ready;
             cpuAppliedCode = null;
-            cpuPendingCode = null;
-            lastCpuMutationTick = null;
-            cpuMutationTimingFaulted = false;
         }
         catch (Exception failure)
         {
@@ -945,7 +827,8 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             throw new IOException(
                 "CPU recovery refused because the firmware profile is no longer B1.");
         }
-        ValidateCpuSafetyState(snapshot.AsSpan(configurationLength, safetyLength));
+        ValidateCpuRecoverySafetyState(
+            snapshot.AsSpan(configurationLength, safetyLength));
         F7bsdCpuRowState[] current = F7bsdCpuPolicy.FromMutableBytes(
             snapshot.AsSpan(configurationLength + safetyLength));
         F7bsdCpuRowState[] baseline = F7bsdCpuPolicy.GetB1MutableStates();
@@ -1035,9 +918,6 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         cpuExpected = baseline;
         ClearCpuRecoveryCertificate();
         cpuAppliedCode = null;
-        cpuPendingCode = null;
-        lastCpuMutationTick = null;
-        cpuMutationTimingFaulted = false;
         cpuState = CpuControlState.FaultedRestored;
     }
 
@@ -1107,6 +987,15 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
 
     private static void ValidateCpuSafetyState(ReadOnlySpan<byte> values)
     {
+        ValidateCpuRecoverySafetyState(values);
+        if (values[3] > F7bsdProfile.MaximumCode)
+        {
+            throw new IOException("The CPU target is outside code 0..51.");
+        }
+    }
+
+    private static void ValidateCpuRecoverySafetyState(ReadOnlySpan<byte> values)
+    {
         if (values.Length != F7bsdProfile.CpuSafetyStateAddresses.Length)
         {
             throw new ArgumentException("Unexpected CPU safety-state length.", nameof(values));
@@ -1120,10 +1009,13 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         {
             throw new IOException("The CPU firmware-temperature override is active.");
         }
-        if (values[3] > F7bsdProfile.MaximumCode)
-        {
-            throw new IOException("The CPU target is outside code 0..51.");
-        }
+
+        // 0x0884 is a firmware output, not a host-owned setting. When a stale
+        // selector row is evaluated immediately after a large cooling/resume
+        // jump, the EC's unsigned slope arithmetic can transiently exceed 51.
+        // Restoration must still be able to replace an exactly certified
+        // mutable table with exact B1. Normal target mutations retain the
+        // stricter 0..51 check above.
     }
 
     private F7bsdTelemetry ReadStableTelemetry(IF7bsdTransport active)

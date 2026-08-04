@@ -15,7 +15,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $OutputDirectory,
 
-    [string] $CpuBurnExecutable
+    [string] $CpuBurnExecutable,
+
+    [string] $CpuControlId =
+        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,7 +35,7 @@ $ids = [ordered]@{
     SystemRpm = 'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.fan2'
     CpuTemperature = 'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-temperature'
     SystemTemperature = 'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-temperature'
-    CpuControl = 'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-native-v3'
+    CpuControl = $CpuControlId
     SystemControl = 'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-raw-v2'
 }
 

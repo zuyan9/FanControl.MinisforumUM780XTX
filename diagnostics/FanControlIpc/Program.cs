@@ -153,7 +153,7 @@ string SampleSensors(int seconds, string samplePath)
         "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.fan2",
         "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-temperature",
         "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-temperature",
-        "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-native-v3",
+        "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4",
         "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-raw-v2",
     ];
 

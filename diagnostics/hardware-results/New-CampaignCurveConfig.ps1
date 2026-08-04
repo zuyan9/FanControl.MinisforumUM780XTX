@@ -13,7 +13,10 @@ param(
     [string] $EvidenceDirectory,
 
     [Parameter(Mandatory = $true)]
-    [string] $FanControlConfigDirectory
+    [string] $FanControlConfigDirectory,
+
+    [string] $CpuControlId =
+        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +29,7 @@ $curveSource = [System.IO.File]::ReadAllText($CurveSourceConfig) |
     ConvertFrom-Json
 $controls = @($config.FanControl.Controls)
 if ($controls.Count -ne 2 -or
-    $controls[0].Identifier -notmatch 'cpu-native-v3$' -or
+    $controls[0].Identifier -ne $CpuControlId -or
     $controls[1].Identifier -notmatch 'system-raw-v2$') {
     throw 'The base config does not contain the exact two expected controls.'
 }
@@ -48,7 +51,7 @@ if ($cpuCurve[0].SelectedTempSource.Identifier -notmatch
 $cpuCurve = $cpuCurve[0] | ConvertTo-Json -Depth 20 | ConvertFrom-Json
 $systemCurve = $systemCurve[0] | ConvertTo-Json -Depth 20 |
     ConvertFrom-Json
-$cpuCurve.Name = 'CPU Safe Curve v3'
+$cpuCurve.Name = 'CPU Cool-Stop Curve v4'
 $systemCurve.Name = 'System Raw Curve v2'
 $config.FanControl.FanCurves = @($cpuCurve, $systemCurve)
 

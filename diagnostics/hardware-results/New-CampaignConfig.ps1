@@ -18,7 +18,10 @@ param(
     [switch] $SystemFirst,
 
     [Parameter(Mandatory = $true)]
-    [string] $FanControlConfigDirectory
+    [string] $FanControlConfigDirectory,
+
+    [string] $CpuControlId =
+        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,7 +32,7 @@ if ($Name -notmatch '^[A-Za-z0-9._-]+$') {
 $config = [System.IO.File]::ReadAllText($BaseConfig) | ConvertFrom-Json
 $controls = @($config.FanControl.Controls)
 if ($controls.Count -ne 2 -or
-    $controls[0].Identifier -notmatch 'cpu-native-v3$' -or
+    $controls[0].Identifier -ne $CpuControlId -or
     $controls[1].Identifier -notmatch 'system-raw-v2$') {
     throw 'The base config does not contain the exact two expected controls.'
 }

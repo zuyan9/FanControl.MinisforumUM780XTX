@@ -22,8 +22,9 @@ internal readonly record struct F7bsdCpuTransitionStep(
 /// <summary>
 /// Compiles a requested CPU target into the immutable B1 temperature bands.
 /// Fan Control owns the low-temperature request while an EC-resident thermal
-/// envelope reaches code 51 at 93 C. The separate critical row remains exact
-/// B1 and takes over at 94 C.
+/// envelope begins with a proven sustainable code 10 above 66 C and reaches
+/// code 51 at 93 C. The separate critical row remains exact B1 and takes over
+/// at 94 C.
 /// </summary>
 internal static class F7bsdCpuPolicy
 {
@@ -39,6 +40,7 @@ internal static class F7bsdCpuPolicy
     private const int SlopeValueCount = 0x100;
     private const int StateCount = (F7bsdProfile.MaximumCode + 1) * SlopeValueCount;
     private const int Unvisited = -2;
+    internal const int MaximumDirectPlannerNeighborChecks = StateCount * 2;
 
     private static readonly F7bsdCpuPolicyRow[] BalancedRows =
     [
@@ -69,8 +71,8 @@ internal static class F7bsdCpuPolicy
     /// <summary>
     /// Compiles a requested code as a low-temperature target. The result also
     /// dominates the monotone EC thermal envelope at every temperature in each
-    /// immutable B1 band. Codes 0 through 10 intentionally compile to the same
-    /// 1000-RPM minimum policy.
+    /// immutable B1 band. Code 0 is a genuine cool-temperature stop request;
+    /// all 52 requested codes compile to distinct physical policies.
     /// </summary>
     internal static F7bsdCpuRowState[] CompileTarget(byte requestedCode)
     {
@@ -191,8 +193,10 @@ internal static class F7bsdCpuPolicy
     }
 
     /// <summary>
-    /// Returns the conservative EC-resident thermal minimum in target-code
-    /// units. It is 1000 RPM through 74 C and rises to 5100 RPM at 93 C.
+    /// Returns the EC-resident thermal minimum in target-code units. It permits
+    /// a cool stop through 66 C, requires the proven sustainable code 10 from
+    /// 67 through 74 C, then follows the validated high-temperature tail to
+    /// 5100 RPM at 93 C.
     /// </summary>
     internal static int ThermalFloorCode(int temperatureC)
     {
@@ -200,9 +204,17 @@ internal static class F7bsdCpuPolicy
         {
             throw new ArgumentOutOfRangeException(nameof(temperatureC));
         }
+        if (temperatureC <= 66)
+        {
+            return 0;
+        }
         if (temperatureC <= 74)
         {
             return 10;
+        }
+        if (temperatureC <= 76)
+        {
+            return (3 * (temperatureC - 66)) / 2;
         }
         if (temperatureC <= 82)
         {
@@ -343,10 +355,27 @@ internal static class F7bsdCpuPolicy
         int rowIndex,
         F7bsdCpuRowState from,
         F7bsdCpuRowState to,
-        out F7bsdCpuRowState[] path)
+        out F7bsdCpuRowState[] path) => TryPlanDirectRowTransition(
+            rowIndex,
+            from,
+            to,
+            out path,
+            out _);
+
+    /// <summary>
+    /// Test-visible overload that reports the deterministic search budget.
+    /// Each safe base/slope row or column is expanded at most once.
+    /// </summary>
+    internal static bool TryPlanDirectRowTransition(
+        int rowIndex,
+        F7bsdCpuRowState from,
+        F7bsdCpuRowState to,
+        out F7bsdCpuRowState[] path,
+        out int neighborChecks)
     {
         AssertNormalRowIndex(rowIndex);
         path = [];
+        neighborChecks = 0;
         if (!IsTransitionBounded(rowIndex, from) ||
             !IsTransitionBounded(rowIndex, to))
         {
@@ -357,7 +386,10 @@ internal static class F7bsdCpuPolicy
             return true;
         }
 
-        bool[] allowed = BuildTransitionStateSet(rowIndex, from, to);
+        // Zero means unknown, +1 allowed, and -1 rejected. Computing safety
+        // lazily avoids enumerating the entire 13,312-state graph when the
+        // destination is found in the first few BFS layers.
+        sbyte[] allowed = new sbyte[StateCount];
         int start = Encode(from);
         int destination = Encode(to);
         int[] parents = new int[StateCount];
@@ -366,6 +398,9 @@ internal static class F7bsdCpuPolicy
         int[] queue = new int[StateCount];
         int head = 0;
         int tail = 0;
+        int checks = 0;
+        bool[] expandedBases = new bool[F7bsdProfile.MaximumCode + 1];
+        bool[] expandedSlopes = new bool[SlopeValueCount];
         parents[start] = -1;
         queue[tail++] = start;
 
@@ -378,33 +413,48 @@ internal static class F7bsdCpuPolicy
             }
 
             F7bsdCpuRowState state = Decode(current);
-            TryVisit(Encode(new(to.Base, state.Slope)), current);
-            for (int candidateBase = 0;
-                candidateBase <= F7bsdProfile.MaximumCode;
-                candidateBase++)
+            // The first expansion of a slope visits every allowed state in
+            // that column. Re-expanding it can never discover a new state.
+            // Destination-first then ascending order exactly matches the
+            // original exhaustive BFS and therefore preserves its paths.
+            if (!expandedSlopes[state.Slope])
             {
-                if (candidateBase != to.Base)
+                expandedSlopes[state.Slope] = true;
+                TryVisit(Encode(new(to.Base, state.Slope)), current);
+                for (int candidateBase = 0;
+                    candidateBase <= F7bsdProfile.MaximumCode;
+                    candidateBase++)
                 {
-                    TryVisit(
-                        Encode(new((byte)candidateBase, state.Slope)),
-                        current);
+                    if (candidateBase != to.Base)
+                    {
+                        TryVisit(
+                            Encode(new((byte)candidateBase, state.Slope)),
+                            current);
+                    }
                 }
             }
 
-            TryVisit(Encode(new(state.Base, to.Slope)), current);
-            for (int candidateSlope = 0;
-                candidateSlope < SlopeValueCount;
-                candidateSlope++)
+            // Likewise, the first expansion of a base visits its complete
+            // allowed row, in the same deterministic neighbor order.
+            if (!expandedBases[state.Base])
             {
-                if (candidateSlope != to.Slope)
+                expandedBases[state.Base] = true;
+                TryVisit(Encode(new(state.Base, to.Slope)), current);
+                for (int candidateSlope = 0;
+                    candidateSlope < SlopeValueCount;
+                    candidateSlope++)
                 {
-                    TryVisit(
-                        Encode(new(state.Base, (byte)candidateSlope)),
-                        current);
+                    if (candidateSlope != to.Slope)
+                    {
+                        TryVisit(
+                            Encode(new(state.Base, (byte)candidateSlope)),
+                            current);
+                    }
                 }
             }
         }
 
+        neighborChecks = checks;
         if (parents[destination] == Unvisited)
         {
             return false;
@@ -421,9 +471,10 @@ internal static class F7bsdCpuPolicy
 
         void TryVisit(int candidate, int parent)
         {
+            checks++;
             if (candidate == parent ||
                 parents[candidate] != Unvisited ||
-                !allowed[candidate])
+                !IsAllowed(candidate))
             {
                 return;
             }
@@ -431,6 +482,21 @@ internal static class F7bsdCpuPolicy
             parents[candidate] = parent;
             depths[candidate] = checked((byte)(depths[parent] + 1));
             queue[tail++] = candidate;
+        }
+
+        bool IsAllowed(int candidate)
+        {
+            if (allowed[candidate] == 0)
+            {
+                allowed[candidate] = IsTransitionStateAllowed(
+                    rowIndex,
+                    Decode(candidate),
+                    from,
+                    to)
+                    ? (sbyte)1
+                    : (sbyte)-1;
+            }
+            return allowed[candidate] > 0;
         }
     }
 
@@ -551,10 +617,7 @@ internal static class F7bsdCpuPolicy
                 : tables[requested - 1];
             for (int row = 0; row < NormalRowCount; row++)
             {
-                table[row] = CompileRowTarget(
-                    row,
-                    (byte)requested,
-                    previous is null ? null : previous[row]);
+                table[row] = CompileRowTarget(row, (byte)requested);
                 if (!DominatesThermalEnvelopeAndRequest(
                     row,
                     table[row],
@@ -579,81 +642,53 @@ internal static class F7bsdCpuPolicy
 
     private static F7bsdCpuRowState CompileRowTarget(
         int rowIndex,
-        byte requestedCode,
-        F7bsdCpuRowState? previousCodeState)
+        byte requestedCode)
     {
-        F7bsdCpuPolicyRow band = BalancedRows[rowIndex];
-        bool found = false;
-        int bestTotalOvershoot = int.MaxValue;
-        int bestMaximumOvershoot = int.MaxValue;
-        F7bsdCpuRowState best = default;
-
-        for (int candidateBase = 0;
-            candidateBase <= F7bsdProfile.MaximumCode;
-            candidateBase++)
+        // These are the closed forms of the former exhaustive 52-by-256
+        // candidate search, including its total-overshoot, maximum-overshoot,
+        // base, then slope tie-breaks. BuildCompiledTargets still exhaustively
+        // validates the resulting 52 tables against every integer temperature,
+        // both hysteresis paths, and the preceding requested code.
+        if (rowIndex <= 3)
         {
-            for (int candidateSlope = 0;
-                candidateSlope < SlopeValueCount;
-                candidateSlope++)
-            {
-                F7bsdCpuRowState candidate = new(
-                    (byte)candidateBase,
-                    (byte)candidateSlope);
-                int totalOvershoot = 0;
-                int maximumOvershoot = 0;
-                bool valid = true;
-
-                for (int temperature = band.Lower;
-                    temperature <= band.Upper;
-                    temperature++)
-                {
-                    int required = Math.Max(
-                        requestedCode,
-                        ThermalFloorCode(temperature));
-                    if (previousCodeState is F7bsdCpuRowState previous)
-                    {
-                        required = Math.Max(
-                            required,
-                            TargetAt(rowIndex, previous, temperature));
-                    }
-
-                    int target = TargetAt(rowIndex, candidate, temperature);
-                    if (target < required || target > F7bsdProfile.MaximumCode)
-                    {
-                        valid = false;
-                        break;
-                    }
-
-                    int overshoot = target - required;
-                    totalOvershoot += overshoot;
-                    maximumOvershoot = Math.Max(maximumOvershoot, overshoot);
-                }
-
-                if (!valid ||
-                    !IsBetterCandidate(
-                        totalOvershoot,
-                        maximumOvershoot,
-                        candidate,
-                        found,
-                        bestTotalOvershoot,
-                        bestMaximumOvershoot,
-                        best))
-                {
-                    continue;
-                }
-
-                found = true;
-                bestTotalOvershoot = totalOvershoot;
-                bestMaximumOvershoot = maximumOvershoot;
-                best = candidate;
-            }
+            return new(requestedCode, 0);
         }
 
-        return found
-            ? best
-            : throw new InvalidOperationException(
-                $"No thermally safe CPU row {rowIndex} encoding exists for " +
-                $"target {requestedCode}.");
+        if (rowIndex == 4)
+        {
+            if (requestedCode <= 10)
+            {
+                return new(10, 50);
+            }
+            return requestedCode <= 15
+                ? new(requestedCode, (byte)((15 - requestedCode) * 10))
+                : new(requestedCode, 0);
+        }
+
+        if (rowIndex == 5)
+        {
+            if (requestedCode <= 19)
+            {
+                return new(19, 188);
+            }
+            if (requestedCode <= 41)
+            {
+                int rise = 41 - requestedCode;
+                return new(
+                    requestedCode,
+                    (byte)(((rise * 100) + 11) / 12));
+            }
+            return new(requestedCode, 0);
+        }
+
+        if (rowIndex == 6)
+        {
+            return requestedCode <= 41
+                ? new(41, 200)
+                : new(requestedCode, (byte)((51 - requestedCode) * 20));
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(rowIndex));
     }
 
     private static void ValidateCompleteTarget(
@@ -717,68 +752,28 @@ internal static class F7bsdCpuPolicy
         return true;
     }
 
-    private static bool IsBetterCandidate(
-        int totalOvershoot,
-        int maximumOvershoot,
-        F7bsdCpuRowState candidate,
-        bool found,
-        int bestTotalOvershoot,
-        int bestMaximumOvershoot,
-        F7bsdCpuRowState best)
-    {
-        if (!found || totalOvershoot != bestTotalOvershoot)
-        {
-            return !found || totalOvershoot < bestTotalOvershoot;
-        }
-        if (maximumOvershoot != bestMaximumOvershoot)
-        {
-            return maximumOvershoot < bestMaximumOvershoot;
-        }
-        if (candidate.Base != best.Base)
-        {
-            return candidate.Base < best.Base;
-        }
-        return candidate.Slope < best.Slope;
-    }
-
-    private static bool[] BuildTransitionStateSet(
+    private static bool IsTransitionStateAllowed(
         int rowIndex,
+        F7bsdCpuRowState candidate,
         F7bsdCpuRowState from,
         F7bsdCpuRowState to)
     {
         F7bsdCpuPolicyRow band = BalancedRows[rowIndex];
-        bool[] allowed = new bool[StateCount];
-        for (int candidateBase = 0;
-            candidateBase <= F7bsdProfile.MaximumCode;
-            candidateBase++)
+        for (int temperature = band.Lower;
+            temperature <= band.Upper;
+            temperature++)
         {
-            for (int candidateSlope = 0;
-                candidateSlope < SlopeValueCount;
-                candidateSlope++)
+            int target = TargetAt(rowIndex, candidate, temperature);
+            int lowerEndpoint = Math.Min(
+                TargetAt(rowIndex, from, temperature),
+                TargetAt(rowIndex, to, temperature));
+            if (target < lowerEndpoint ||
+                target > F7bsdProfile.MaximumCode)
             {
-                F7bsdCpuRowState candidate = new(
-                    (byte)candidateBase,
-                    (byte)candidateSlope);
-                bool safe = true;
-                for (int temperature = band.Lower;
-                    temperature <= band.Upper;
-                    temperature++)
-                {
-                    int target = TargetAt(rowIndex, candidate, temperature);
-                    int lowerEndpoint = Math.Min(
-                        TargetAt(rowIndex, from, temperature),
-                        TargetAt(rowIndex, to, temperature));
-                    if (target < lowerEndpoint ||
-                        target > F7bsdProfile.MaximumCode)
-                    {
-                        safe = false;
-                        break;
-                    }
-                }
-                allowed[Encode(candidate)] = safe;
+                return false;
             }
         }
-        return allowed;
+        return true;
     }
 
     private static F7bsdCpuTransitionStep CreateTransitionStep(

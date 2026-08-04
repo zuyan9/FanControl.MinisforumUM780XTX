@@ -1,10 +1,5 @@
 namespace FanControl.MinisforumUM780XTX;
 
-internal sealed class DeferredCpuControlException(Exception innerException) :
-    IOException("A deferred CPU target transaction failed.", innerException)
-{
-}
-
 internal interface IF7bsdBackend : IDisposable
 {
     void Initialize();
