@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>FanControl.MinisforumUM780XTX.Diagnostics</AssemblyName>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <FanControlDir Condition="'$(FanControlDir)' == ''">C:\Program Files (x86)\FanControl</FanControlDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FanControl.MinisforumUM780XTX.csproj" />
+    <Reference Include="FanControl.Plugins">
+      <HintPath>$(FanControlDir)\FanControl.Plugins.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="$(FanControlDir)\LibreHardwareMonitorLib.dll"
+          Link="LibreHardwareMonitorLib.dll"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

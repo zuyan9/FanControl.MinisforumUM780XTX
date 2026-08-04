@@ -2,7 +2,7 @@ using FanControl.Plugins;
 
 namespace FanControl.MinisforumUM780XTX;
 
-/// <summary>Exposes verified F7BSD fan telemetry and raw closed-loop targets.</summary>
+/// <summary>Exposes verified F7BSD fan telemetry and dual fan controls.</summary>
 public sealed class UM780XTXPlugin : IPlugin2
 {
     private readonly Func<IF7bsdBackend> backendFactory;
@@ -23,6 +23,8 @@ public sealed class UM780XTXPlugin : IPlugin2
     private readonly ControlSensor cpuControl;
     private readonly ControlSensor systemControl;
     private IF7bsdBackend? backend;
+    private int consecutiveTelemetryFailures;
+    private bool telemetryFaulted;
 
     /// <summary>Creates the plugin with the native PawnIO backend.</summary>
     public UM780XTXPlugin()
@@ -43,18 +45,24 @@ public sealed class UM780XTXPlugin : IPlugin2
         this.backendFactory = backendFactory;
         this.logger = logger;
         cpuControl = new ControlSensor(
-            "minisforum.um780xtx.f7bsd.cpu-control",
-            "UM780 XTX CPU Fan Control",
+            "minisforum.um780xtx.f7bsd.cpu-minimum-v2",
+            "UM780 XTX CPU Fan Minimum (OEM Floor)",
             $"{Name}/{cpuFan.Id}",
             value => Set(F7bsdFan.Cpu, value),
             () => Reset(F7bsdFan.Cpu),
+            exception => Log(
+                "Minisforum UM780 XTX CPU control failed and was disabled: " +
+                exception.Message),
             lifecycleSync);
         systemControl = new ControlSensor(
-            "minisforum.um780xtx.f7bsd.system-control",
-            "UM780 XTX System Fan Control",
+            "minisforum.um780xtx.f7bsd.system-raw-v2",
+            "UM780 XTX System Fan Raw Target",
             $"{Name}/{systemFan.Id}",
             value => Set(F7bsdFan.System, value),
             () => Reset(F7bsdFan.System),
+            exception => Log(
+                "Minisforum UM780 XTX system control failed and was disabled: " +
+                exception.Message),
             lifecycleSync);
     }
 
@@ -67,12 +75,20 @@ public sealed class UM780XTXPlugin : IPlugin2
         lock (lifecycleSync)
         {
             Close();
+            if (backend is not null)
+            {
+                throw new InvalidOperationException(
+                    "The previous F7BSD backend still requires verified restoration. " +
+                    "Restart Windows before reinitializing the plugin.");
+            }
             IF7bsdBackend candidate = backendFactory();
             try
             {
                 candidate.Initialize();
                 Apply(candidate.ReadTelemetry());
                 backend = candidate;
+                consecutiveTelemetryFailures = 0;
+                telemetryFaulted = false;
                 Log("Minisforum UM780 XTX F7BSD backend initialized.");
             }
             catch
@@ -91,7 +107,9 @@ public sealed class UM780XTXPlugin : IPlugin2
             container.FanSensors.AddRange([cpuFan, systemFan]);
             container.TempSensors.AddRange([cpuTemperature, systemTemperature]);
             container.ControlSensors.AddRange([cpuControl, systemControl]);
-            Log("Minisforum UM780 XTX loaded raw CPU and system target controls.");
+            Log(
+                "Minisforum UM780 XTX loaded CPU OEM-floor and guarded raw " +
+                "system-fan controls.");
         }
     }
 
@@ -100,17 +118,36 @@ public sealed class UM780XTXPlugin : IPlugin2
     {
         lock (lifecycleSync)
         {
+            if (telemetryFaulted)
+            {
+                return;
+            }
             try
             {
                 if (backend is not null)
                 {
                     Apply(backend.ReadTelemetry());
+                    consecutiveTelemetryFailures = 0;
                 }
             }
             catch (Exception exception)
             {
+                consecutiveTelemetryFailures++;
                 ClearTelemetry();
-                Log($"Minisforum UM780 XTX telemetry read failed: {exception.Message}");
+                systemControl.ClearValue();
+                if (consecutiveTelemetryFailures == 1)
+                {
+                    Log($"Minisforum UM780 XTX telemetry read failed: {exception.Message}");
+                }
+                if (consecutiveTelemetryFailures >= 3)
+                {
+                    telemetryFaulted = true;
+                    systemControl.Fault();
+                    Log(
+                        "Minisforum UM780 XTX telemetry disabled after three " +
+                        "consecutive failures; refresh the plugin after checking " +
+                        "stock state.");
+                }
             }
         }
     }
@@ -122,9 +159,10 @@ public sealed class UM780XTXPlugin : IPlugin2
         {
             cpuControl.Clear();
             systemControl.Clear();
+            consecutiveTelemetryFailures = 0;
+            telemetryFaulted = false;
             ClearTelemetry();
             IF7bsdBackend? old = backend;
-            backend = null;
             if (old is null)
             {
                 return;
@@ -133,10 +171,13 @@ public sealed class UM780XTXPlugin : IPlugin2
             try
             {
                 old.Dispose();
+                backend = null;
             }
             catch (Exception exception)
             {
-                Log($"Minisforum UM780 XTX baseline restoration failed: {exception.Message}");
+                Log(
+                    "Minisforum UM780 XTX baseline restoration remains pending: " +
+                    exception.Message);
             }
         }
     }
@@ -145,6 +186,12 @@ public sealed class UM780XTXPlugin : IPlugin2
     {
         lock (lifecycleSync)
         {
+            if (fan == F7bsdFan.System && telemetryFaulted)
+            {
+                throw new InvalidOperationException(
+                    "System control is unavailable while guarded telemetry is disabled. " +
+                    "Refresh the plugin after checking stock state.");
+            }
             byte requestedCode = F7bsdProfile.ToCode(percentage);
             return (backend ??
                 throw new InvalidOperationException("The F7BSD backend is unavailable."))
@@ -166,6 +213,7 @@ public sealed class UM780XTXPlugin : IPlugin2
         systemFan.Value = telemetry.SystemFanRpm;
         cpuTemperature.Value = telemetry.CpuTemperatureC;
         systemTemperature.Value = telemetry.SystemTemperatureC;
+        systemControl.SetConfirmedCode(telemetry.SystemAppliedCode);
     }
 
     private void ClearTelemetry()
@@ -206,6 +254,7 @@ public sealed class UM780XTXPlugin : IPlugin2
         string pairedFanSensorId,
         Func<float, byte> set,
         Action reset,
+        Action<Exception> reportFailure,
         object sync) : IPluginControlSensor2
     {
         public string Id { get; } = id;
@@ -220,7 +269,20 @@ public sealed class UM780XTXPlugin : IPlugin2
         {
             lock (sync)
             {
-                Value = F7bsdProfile.ToPercentage(set(value));
+                if (faulted)
+                {
+                    return;
+                }
+                try
+                {
+                    Value = F7bsdProfile.ToPercentage(set(value));
+                }
+                catch (Exception exception)
+                {
+                    faulted = true;
+                    Value = null;
+                    reportFailure(exception);
+                }
             }
         }
 
@@ -228,8 +290,18 @@ public sealed class UM780XTXPlugin : IPlugin2
         {
             lock (sync)
             {
-                reset();
-                Value = null;
+                try
+                {
+                    reset();
+                    faulted = false;
+                    Value = null;
+                }
+                catch (Exception exception)
+                {
+                    faulted = true;
+                    Value = null;
+                    reportFailure(exception);
+                }
             }
         }
 
@@ -241,8 +313,43 @@ public sealed class UM780XTXPlugin : IPlugin2
         {
             lock (sync)
             {
+                faulted = false;
                 Value = null;
             }
         }
+
+        internal void ClearValue()
+        {
+            lock (sync)
+            {
+                Value = null;
+            }
+        }
+
+        internal void Fault()
+        {
+            lock (sync)
+            {
+                faulted = true;
+                Value = null;
+            }
+        }
+
+        internal void SetConfirmedCode(byte? code)
+        {
+            lock (sync)
+            {
+                if (faulted)
+                {
+                    Value = null;
+                    return;
+                }
+                Value = code.HasValue
+                    ? F7bsdProfile.ToPercentage(code.Value)
+                    : null;
+            }
+        }
+
+        private bool faulted;
     }
 }
