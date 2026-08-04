@@ -45,8 +45,8 @@ public sealed class UM780XTXPlugin : IPlugin2
         this.backendFactory = backendFactory;
         this.logger = logger;
         cpuControl = new ControlSensor(
-            "minisforum.um780xtx.f7bsd.cpu-minimum-v2",
-            "UM780 XTX CPU Fan Minimum (OEM Floor)",
+            "minisforum.um780xtx.f7bsd.cpu-native-v3",
+            "UM780 XTX CPU Fan Target (EC Thermal Tail)",
             $"{Name}/{cpuFan.Id}",
             value => Set(F7bsdFan.Cpu, value),
             () => Reset(F7bsdFan.Cpu),
@@ -108,7 +108,7 @@ public sealed class UM780XTXPlugin : IPlugin2
             container.TempSensors.AddRange([cpuTemperature, systemTemperature]);
             container.ControlSensors.AddRange([cpuControl, systemControl]);
             Log(
-                "Minisforum UM780 XTX loaded CPU OEM-floor and guarded raw " +
+                "Minisforum UM780 XTX loaded native CPU-target and guarded raw " +
                 "system-fan controls.");
         }
     }
@@ -129,6 +129,16 @@ public sealed class UM780XTXPlugin : IPlugin2
                     Apply(backend.ReadTelemetry());
                     consecutiveTelemetryFailures = 0;
                 }
+            }
+            catch (DeferredCpuControlException exception)
+            {
+                consecutiveTelemetryFailures = 0;
+                ClearTelemetry();
+                cpuControl.Fault();
+                Log(
+                    "Minisforum UM780 XTX deferred CPU control failed and was " +
+                    "disabled: " + (exception.InnerException?.Message ??
+                        exception.Message));
             }
             catch (Exception exception)
             {
@@ -213,6 +223,7 @@ public sealed class UM780XTXPlugin : IPlugin2
         systemFan.Value = telemetry.SystemFanRpm;
         cpuTemperature.Value = telemetry.CpuTemperatureC;
         systemTemperature.Value = telemetry.SystemTemperatureC;
+        cpuControl.SetConfirmedCode(telemetry.CpuAppliedCode);
         systemControl.SetConfirmedCode(telemetry.SystemAppliedCode);
     }
 

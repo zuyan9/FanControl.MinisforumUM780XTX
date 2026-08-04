@@ -33,8 +33,10 @@ internal static class Program
         (string Name, Action Body)[] tests =
         [
             ("linear percentage conversion", LinearPercentageConversion),
-            ("CPU B1 floor compiler", CpuB1FloorCompiler),
-            ("CPU B1 transitions exhaustive", CpuB1TransitionsExhaustive),
+            ("CPU thermal-envelope compiler exhaustive", CpuThermalEnvelopeCompilerExhaustive),
+            ("CPU bytewise transitions exhaustive", CpuBytewiseTransitionsExhaustive),
+            ("CPU exact B1 reset exhaustive", CpuExactB1ResetExhaustive),
+            ("CPU certified-prefix recovery", CpuCertifiedPrefixRecovery),
             ("thin write allowlist", ThinWriteAllowlist),
             ("tach low-high-low decoder", TachLowHighLowDecoder),
             ("PawnIO parks every EC and PNP byte", PawnIoParksEveryByte),
@@ -48,9 +50,10 @@ internal static class Program
             ("initialization identity and critical-row gates", InitializationIdentityAndCriticalGates),
             ("initialization rejects non-stock controller policy state", InitializationRejectsNonStockPolicyState),
             ("external system ownership is refused on initialize", ExternalSystemOwnershipIsRefused),
-            ("OEM-floor CPU target lifecycle", CpuFloorTargetLifecycle),
-            ("CPU floor failure restores baseline", CpuFloorFailureRestoresBaseline),
+            ("native CPU target lifecycle", CpuNativeTargetLifecycle),
+            ("CPU target failure restores exact B1", CpuTargetFailureRestoresB1),
             ("every partial CPU transition restores B1", PartialCpuTransitionsRestoreB1),
+            ("interrupted CPU recovery resumes certified suffix", InterruptedCpuRecoveryResumesCertifiedSuffix),
             ("CPU precondition drift writes nothing", CpuPreconditionDriftWritesNothing),
             ("CPU restore refuses immutable profile drift", CpuRestoreIgnoresMutableConfiguration),
             ("system ownership lifecycle", SystemOwnershipLifecycle),
@@ -61,12 +64,16 @@ internal static class Program
             ("persistent owned telemetry failure releases system", PersistentOwnedTelemetryFailureReleasesSystem),
             ("system guard gap releases to firmware", SystemGuardGapReleasesToFirmware),
             ("system drift faults without reengaging", SystemDriftFaultsWithoutReengaging),
-            ("CPU zero preserves OEM policy", CpuZeroPreservesOemPolicy),
+            ("CPU zero uses EC thermal tail", CpuZeroUsesEcThermalTail),
+            ("CPU mutation rate limit and coalescing", CpuMutationRateLimitAndCoalescing),
+            ("CPU timing faults freeze the confirmed table", CpuTimingFaultsFreezeConfirmedTable),
             ("duplicate control requests are cached", DuplicateControlRequestsAreCached),
             ("telemetry guards system control", TelemetryGuardsSystemControl),
             ("close restores both controls", CloseRestoresBothControls),
             ("close continues restoration after failure", CloseContinuesAfterRestoreFailure),
             ("plugin sensor and dual-control lifecycle", PluginSensorAndRawControlLifecycle),
+            ("plugin reports coalesced CPU telemetry confirmation", PluginReportsCoalescedCpuTelemetryConfirmation),
+            ("plugin isolates deferred CPU control failure", PluginIsolatesDeferredCpuControlFailure),
             ("plugin control failures are contained", PluginControlFailuresAreContained),
             ("plugin telemetry error clears stale values", PluginTelemetryErrorClearsStaleValues),
             ("plugin persistent telemetry failure latches", PluginPersistentTelemetryFailureLatches),
@@ -147,7 +154,7 @@ internal static class Program
             [new EcWrite(0x088b, 1)]));
     }
 
-    private static void CpuB1FloorCompiler()
+    private static void CpuThermalEnvelopeCompilerExhaustive()
     {
         byte[] exactB1 =
         {
@@ -156,58 +163,181 @@ internal static class Program
         };
         SequenceEqual(
             exactB1,
-            F7bsdCpuPolicy.ToMutableBytes(F7bsdCpuPolicy.CompileFloor(0)));
+            F7bsdCpuPolicy.ToMutableBytes(F7bsdCpuPolicy.GetB1MutableStates()));
+        Equal(
+            new F7bsdCpuPolicyRow(51, 100, 93, 0),
+            F7bsdCpuPolicy.GetB1Row(7));
 
-        for (byte code = 0; code <= F7bsdProfile.MaximumCode; code++)
+        (int Temperature, int Code)[] envelopeAnchors =
+        [
+            (0, 10), (74, 10), (75, 13), (76, 15), (77, 18),
+            (78, 20), (79, 23), (80, 25), (81, 28), (82, 30),
+            (83, 32), (84, 34), (85, 35), (86, 37), (87, 39),
+            (88, 40), (89, 43), (90, 45), (91, 47), (92, 49),
+            (93, 51),
+        ];
+        foreach ((int temperature, int code) in envelopeAnchors)
         {
-            F7bsdCpuRowState[] states = F7bsdCpuPolicy.CompileFloor(code);
-            Equal(F7bsdCpuPolicy.NormalRowCount, states.Length);
-            for (int row = 0; row < states.Length; row++)
-            {
-                True(F7bsdCpuPolicy.DominatesB1AndFloor(row, states[row], code));
-                True(F7bsdCpuPolicy.IsB1Safe(row, states[row]));
-            }
-            F7bsdCpuPolicyRow[] complete = F7bsdCpuPolicy.CompileFloorRows(code);
-            Equal(F7bsdCpuPolicy.GetB1Row(7), complete[7]);
+            Equal(code, F7bsdCpuPolicy.ThermalFloorCode(temperature));
+        }
+        int previousEnvelope = -1;
+        for (int temperature = 0;
+            temperature < F7bsdCpuPolicy.CriticalTemperatureC;
+            temperature++)
+        {
+            int floor = F7bsdCpuPolicy.ThermalFloorCode(temperature);
+            True(floor >= 10 && floor <= F7bsdProfile.MaximumCode);
+            True(floor >= previousEnvelope);
+            previousEnvelope = floor;
         }
 
-        Throws<ArgumentOutOfRangeException>(() => F7bsdCpuPolicy.CompileFloor(52));
+        F7bsdCpuRowState[][] targets = Enumerable
+            .Range(0, F7bsdProfile.MaximumCode + 1)
+            .Select(code => F7bsdCpuPolicy.CompileTarget((byte)code))
+            .ToArray();
+        for (byte code = 0; code <= F7bsdProfile.MaximumCode; code++)
+        {
+            F7bsdCpuRowState[] states = targets[code];
+            Equal(F7bsdCpuPolicy.NormalRowCount, states.Length);
+            SequenceEqual(
+                states,
+                F7bsdCpuPolicy.FromMutableBytes(
+                    F7bsdCpuPolicy.ToMutableBytes(states)));
+            True(F7bsdCpuPolicy.IsKnownControlTable(states));
+
+            F7bsdCpuPolicyRow[] complete =
+                F7bsdCpuPolicy.CompileTargetRows(code);
+            Equal(F7bsdCpuPolicy.TotalRowCount, complete.Length);
+            Equal(F7bsdCpuPolicy.GetB1Row(7), complete[7]);
+            for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
+            {
+                F7bsdCpuPolicyRow b1 = F7bsdCpuPolicy.GetB1Row(row);
+                Equal(b1.Upper, complete[row].Upper);
+                Equal(b1.Lower, complete[row].Lower);
+                Equal(states[row].Base, complete[row].Base);
+                Equal(states[row].Slope, complete[row].Slope);
+                True(F7bsdCpuPolicy.DominatesThermalEnvelopeAndRequest(
+                    row,
+                    states[row],
+                    code));
+                True(F7bsdCpuPolicy.IsCrashSafe(row, states[row]));
+            }
+
+            foreach (bool cooling in new[] { false, true })
+            {
+                int previousTemperatureTarget = -1;
+                for (int temperature = 0;
+                    temperature < F7bsdCpuPolicy.CriticalTemperatureC;
+                    temperature++)
+                {
+                    int target = F7bsdCpuPolicy.EvaluateTable(
+                        states,
+                        temperature,
+                        cooling);
+                    True(target >= code);
+                    True(target >= F7bsdCpuPolicy.ThermalFloorCode(temperature));
+                    True(target <= F7bsdProfile.MaximumCode);
+                    True(target >= previousTemperatureTarget);
+                    if (code > 0)
+                    {
+                        True(target >= F7bsdCpuPolicy.EvaluateTable(
+                            targets[code - 1],
+                            temperature,
+                            cooling));
+                    }
+                    previousTemperatureTarget = target;
+                }
+                Equal(
+                    (int)F7bsdProfile.MaximumCode,
+                    F7bsdCpuPolicy.EvaluateTable(
+                        states,
+                        F7bsdCpuPolicy.CriticalTemperatureC,
+                        cooling));
+            }
+        }
+
+        for (int code = 0; code <= 10; code++)
+        {
+            SequenceEqual(targets[0], targets[code]);
+        }
+        for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
+        {
+            Equal(
+                new F7bsdCpuRowState(F7bsdProfile.MaximumCode, 0),
+                targets[F7bsdProfile.MaximumCode][row]);
+        }
+
+        Throws<ArgumentOutOfRangeException>(() => F7bsdCpuPolicy.CompileTarget(52));
+        Throws<ArgumentOutOfRangeException>(() =>
+            F7bsdCpuPolicy.ThermalFloorCode(
+                F7bsdCpuPolicy.CriticalTemperatureC));
         Throws<ArgumentException>(() => F7bsdCpuPolicy.FromMutableBytes([0, 1]));
     }
 
-    private static void CpuB1TransitionsExhaustive()
+    private static void CpuBytewiseTransitionsExhaustive()
     {
-        int maximum = 0;
-        for (byte fromCode = 0; fromCode <= F7bsdProfile.MaximumCode; fromCode++)
+        F7bsdCpuRowState[][] targets = Enumerable
+            .Range(0, F7bsdProfile.MaximumCode + 1)
+            .Select(code => F7bsdCpuPolicy.CompileTarget((byte)code))
+            .ToArray();
+        bool sawDirect = false;
+        bool sawB1Anchor = false;
+
+        for (int fromCode = 0;
+            fromCode <= F7bsdProfile.MaximumCode;
+            fromCode++)
         {
-            F7bsdCpuRowState[] from = F7bsdCpuPolicy.CompileFloor(fromCode);
-            for (byte toCode = 0; toCode <= F7bsdProfile.MaximumCode; toCode++)
+            F7bsdCpuRowState[] from = targets[fromCode];
+            for (int toCode = 0;
+                toCode <= F7bsdProfile.MaximumCode;
+                toCode++)
             {
-                F7bsdCpuRowState[] to = F7bsdCpuPolicy.CompileFloor(toCode);
+                F7bsdCpuRowState[] to = targets[toCode];
                 for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
                 {
+                    bool hasDirect = F7bsdCpuPolicy.TryPlanDirectRowTransition(
+                        row,
+                        from[row],
+                        to[row],
+                        out F7bsdCpuRowState[] direct);
                     F7bsdCpuRowState[] path = F7bsdCpuPolicy.PlanRowTransition(
                         row,
                         from[row],
                         to[row]);
+
+                    if (hasDirect)
+                    {
+                        sawDirect = true;
+                        True(direct.Length <=
+                            F7bsdCpuPolicy.DirectMaximumWritesPerRow);
+                        SequenceEqual(direct, path);
+                    }
+                    else
+                    {
+                        sawB1Anchor = true;
+                        True(path.Contains(F7bsdCpuPolicy.GetB1Row(row).State));
+                    }
                     True(path.Length <= F7bsdCpuPolicy.MaximumWritesPerRow);
-                    maximum = Math.Max(maximum, path.Length);
+
                     F7bsdCpuRowState previous = from[row];
                     foreach (F7bsdCpuRowState state in path)
                     {
                         Equal(1,
                             (state.Base == previous.Base ? 0 : 1) +
                             (state.Slope == previous.Slope ? 0 : 1));
+                        True(F7bsdCpuPolicy.IsCrashSafe(row, state));
                         F7bsdCpuPolicyRow band = F7bsdCpuPolicy.GetB1Row(row);
                         for (int temperature = band.Lower;
                             temperature <= band.Upper;
                             temperature++)
                         {
-                            int target = F7bsdCpuPolicy.TargetAt(row, state, temperature);
-                            int lower = Math.Min(
-                                F7bsdCpuPolicy.TargetAt(row, from[row], temperature),
-                                F7bsdCpuPolicy.TargetAt(row, to[row], temperature));
-                            True(target >= lower);
+                            int target = F7bsdCpuPolicy.TargetAt(
+                                row,
+                                state,
+                                temperature);
+                            True(target >= F7bsdCpuPolicy.CrashFloorAt(
+                                row,
+                                temperature));
                             True(target <= F7bsdProfile.MaximumCode);
                         }
                         previous = state;
@@ -216,7 +346,121 @@ internal static class Program
                 }
             }
         }
-        Equal(F7bsdCpuPolicy.MaximumWritesPerRow, maximum);
+        True(sawDirect);
+        True(sawB1Anchor);
+    }
+
+    private static void CpuExactB1ResetExhaustive()
+    {
+        F7bsdCpuRowState[] b1 = F7bsdCpuPolicy.GetB1MutableStates();
+        True(F7bsdCpuPolicy.IsKnownControlTable(b1));
+        for (byte code = 0; code <= F7bsdProfile.MaximumCode; code++)
+        {
+            F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(code);
+            F7bsdCpuTransitionStep[] engage = F7bsdCpuPolicy.PlanTransition(b1, target);
+            True(engage.Length <= F7bsdCpuPolicy.MaximumWritesPerTransition);
+            SequenceEqual(target, ApplyCpuTransitionSteps(b1, engage));
+
+            F7bsdCpuTransitionStep[] reset =
+                F7bsdCpuPolicy.PlanTransitionToB1(target);
+            True(reset.Length <= F7bsdCpuPolicy.MaximumWritesPerTransition);
+            SequenceEqual(b1, ApplyCpuTransitionSteps(target, reset));
+            False(reset.Any(step =>
+                CpuCriticalAddresses.Contains(step.Write.Address)));
+        }
+    }
+
+    private static void CpuCertifiedPrefixRecovery()
+    {
+        (F7bsdCpuRowState[] Source, F7bsdCpuRowState[] Destination)[] cases =
+        [
+            (F7bsdCpuPolicy.GetB1MutableStates(), F7bsdCpuPolicy.CompileTarget(0)),
+            (F7bsdCpuPolicy.CompileTarget(0), F7bsdCpuPolicy.CompileTarget(51)),
+            (F7bsdCpuPolicy.CompileTarget(51), F7bsdCpuPolicy.CompileTarget(0)),
+            (F7bsdCpuPolicy.CompileTarget(20), F7bsdCpuPolicy.CompileTarget(21)),
+        ];
+        F7bsdCpuRowState[] b1 = F7bsdCpuPolicy.GetB1MutableStates();
+        foreach ((F7bsdCpuRowState[] source, F7bsdCpuRowState[] destination) in cases)
+        {
+            F7bsdCpuTransitionStep[] issued =
+                F7bsdCpuPolicy.PlanTransition(source, destination);
+            for (int completed = 0; completed <= issued.Length; completed++)
+            {
+                F7bsdCpuRowState[] observed =
+                    F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                        source,
+                        issued,
+                        completed);
+                True(F7bsdCpuPolicy.TryMatchTransitionPrefix(
+                    source,
+                    issued,
+                    observed,
+                    out int matchedPrefix));
+                SequenceEqual(
+                    observed,
+                    F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                        source,
+                        issued,
+                        matchedPrefix));
+
+                F7bsdCpuTransitionStep[] recovery =
+                    F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(
+                        source,
+                        issued,
+                        observed);
+                True(recovery.Length <=
+                    F7bsdCpuPolicy.MaximumCertifiedRecoveryWrites);
+                SequenceEqual(b1, ApplyCpuTransitionSteps(observed, recovery));
+            }
+
+            SequenceEqual(
+                Array.Empty<F7bsdCpuTransitionStep>(),
+                F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(source, issued, b1));
+        }
+
+        F7bsdCpuRowState[] rejectedSource = F7bsdCpuPolicy.CompileTarget(20);
+        F7bsdCpuTransitionStep[] rejectedPlan = F7bsdCpuPolicy.PlanTransition(
+            rejectedSource,
+            F7bsdCpuPolicy.CompileTarget(40));
+        F7bsdCpuRowState[]? unissuedKnownTable = null;
+        for (byte code = 0; code <= F7bsdProfile.MaximumCode; code++)
+        {
+            F7bsdCpuRowState[] candidate = F7bsdCpuPolicy.CompileTarget(code);
+            if (!candidate.SequenceEqual(b1) &&
+                !F7bsdCpuPolicy.TryMatchTransitionPrefix(
+                    rejectedSource,
+                    rejectedPlan,
+                    candidate,
+                    out _))
+            {
+                unissuedKnownTable = candidate;
+                break;
+            }
+        }
+        NotNull(unissuedKnownTable);
+        Throws<InvalidOperationException>(() =>
+            F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(
+                rejectedSource,
+                rejectedPlan,
+                unissuedKnownTable!));
+
+        F7bsdCpuRowState[] unknownSource =
+            F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                rejectedSource,
+                rejectedPlan,
+                1);
+        False(F7bsdCpuPolicy.IsKnownControlTable(unknownSource));
+        Throws<ArgumentException>(() =>
+            F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(
+                unknownSource,
+                rejectedPlan,
+                b1));
+        Throws<ArgumentException>(() =>
+            F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(
+                rejectedSource,
+                new F7bsdCpuTransitionStep[
+                    F7bsdCpuPolicy.MaximumWritesPerTransition + 1],
+                b1));
     }
 
     private static void TachLowHighLowDecoder()
@@ -513,20 +757,32 @@ internal static class Program
         Equal((byte)0xff, transport.ByteAt(0x0889));
     }
 
-    private static void CpuFloorTargetLifecycle()
+    private static void CpuNativeTargetLifecycle()
     {
+        FakeClock clock = new();
         FakeTransport transport = new();
         byte[] baseline = transport.CpuBytes();
         byte[] critical = transport.CriticalBytes();
-        PawnIoF7bsdBackend backend = CreateBackend(transport);
+        PawnIoF7bsdBackend backend = CreateBackend(transport, clock);
         backend.Initialize();
 
-        // Code zero is exactly the OEM policy and therefore emits no write.
+        int beforeFirstSet = transport.WriteBatches.Count;
         Equal((byte)0, backend.Set(F7bsdFan.Cpu, 0));
         AssertCpuPolicy(transport, 0);
+        False(transport.CpuBytes().SequenceEqual(baseline));
         SequenceEqual(critical, transport.CriticalBytes());
-        Equal(0, transport.WriteBatches.Count);
+        AssertOnlyCpuTargetWrites(transport.WritesSince(beforeFirstSet));
 
+        // Codes 0..10 share one physical table; changing the semantic request
+        // in that range must not generate another EC transaction.
+        int equivalentReads = transport.ReadBatches.Count;
+        int equivalentWrites = transport.WriteBatches.Count;
+        Equal((byte)10, backend.Set(F7bsdFan.Cpu, 10));
+        Equal(equivalentReads, transport.ReadBatches.Count);
+        Equal(equivalentWrites, transport.WriteBatches.Count);
+        AssertCpuPolicy(transport, 10);
+
+        clock.Advance(TimeSpan.FromSeconds(1));
         int beforeSecondSet = transport.WriteBatches.Count;
         Equal((byte)51, backend.Set(F7bsdFan.Cpu, 51));
         AssertCpuPolicy(transport, 51);
@@ -548,7 +804,7 @@ internal static class Program
         True(transport.Disposed);
     }
 
-    private static void CpuFloorFailureRestoresBaseline()
+    private static void CpuTargetFailureRestoresB1()
     {
         FakeTransport transport = new();
         byte[] baseline = transport.CpuBytes();
@@ -566,7 +822,9 @@ internal static class Program
 
     private static void PartialCpuTransitionsRestoreB1()
     {
-        int stepCount = F7bsdCpuPolicy.PlanTransition(0, 31).Length;
+        int stepCount = F7bsdCpuPolicy.PlanTransition(
+            F7bsdCpuPolicy.GetB1MutableStates(),
+            F7bsdCpuPolicy.CompileTarget(31)).Length;
         True(stepCount > 1);
         for (int failedAfter = 1; failedAfter <= stepCount; failedAfter++)
         {
@@ -580,16 +838,90 @@ internal static class Program
 
             ThrowsAny<Exception>(() => backend.Set(F7bsdFan.Cpu, 31));
             SequenceEqual(baseline, transport.CpuBytes());
-            for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
-            {
-                True(F7bsdCpuPolicy.IsB1Safe(
-                    row,
-                    F7bsdCpuPolicy.FromMutableBytes(transport.CpuBytes())[row]));
-            }
+            SequenceEqual(
+                F7bsdCpuPolicy.GetB1MutableStates(),
+                F7bsdCpuPolicy.FromMutableBytes(transport.CpuBytes()));
             Throws<InvalidOperationException>(() => backend.Set(F7bsdFan.Cpu, 31));
             backend.Dispose();
             True(transport.Disposed);
         }
+    }
+
+    private static void InterruptedCpuRecoveryResumesCertifiedSuffix()
+    {
+        F7bsdCpuRowState[] b1 = F7bsdCpuPolicy.GetB1MutableStates();
+        F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(31);
+        F7bsdCpuTransitionStep[] issued =
+            F7bsdCpuPolicy.PlanTransition(b1, target);
+        True(issued.Length > 1);
+
+        for (int initialFailure = 1;
+            initialFailure <= issued.Length;
+            initialFailure++)
+        {
+            F7bsdCpuRowState[] observed =
+                F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                    b1,
+                    issued,
+                    initialFailure);
+            F7bsdCpuTransitionStep[] recovery =
+                F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(
+                    b1,
+                    issued,
+                    observed);
+            True(recovery.Length > 0);
+
+            for (int recoveryFailure = 1;
+                recoveryFailure <= recovery.Length;
+                recoveryFailure++)
+            {
+                FakeTransport transport = new();
+                transport.FailAfterIndividualWriteCalls[1] = initialFailure;
+                transport.FailAfterIndividualWriteCalls[2] = recoveryFailure;
+                PawnIoF7bsdBackend backend = CreateBackend(transport);
+                backend.Initialize();
+
+                ThrowsAny<Exception>(() => backend.Set(F7bsdFan.Cpu, 31));
+                backend.Reset(F7bsdFan.Cpu);
+                SequenceEqual(b1, F7bsdCpuPolicy.FromMutableBytes(
+                    transport.CpuBytes()));
+                backend.Dispose();
+                True(transport.Disposed);
+            }
+        }
+
+        // External/non-prefix corruption after an interrupted recovery is not
+        // blessed merely because each byte is allowlisted or looks plausible.
+        F7bsdCpuRowState[] firstObserved =
+            F7bsdCpuPolicy.MaterializeTransitionPrefix(b1, issued, 1);
+        F7bsdCpuTransitionStep[] firstRecovery =
+            F7bsdCpuPolicy.PlanCertifiedRecoveryToB1(
+                b1,
+                issued,
+                firstObserved);
+        FakeTransport corrupted = new();
+        corrupted.FailAfterIndividualWriteCalls[1] = 1;
+        corrupted.FailAfterIndividualWriteCalls[2] = 1;
+        PawnIoF7bsdBackend corruptedBackend = CreateBackend(corrupted);
+        corruptedBackend.Initialize();
+        ThrowsAny<Exception>(() => corruptedBackend.Set(F7bsdFan.Cpu, 31));
+
+        F7bsdCpuRowState[] nonPrefix = (F7bsdCpuRowState[])b1.Clone();
+        nonPrefix[0] = new(F7bsdProfile.MaximumCode, nonPrefix[0].Slope);
+        False(F7bsdCpuPolicy.TryMatchTransitionPrefix(
+            firstObserved,
+            firstRecovery,
+            nonPrefix,
+            out _));
+        corrupted.SetCpuBytes(F7bsdCpuPolicy.ToMutableBytes(nonPrefix));
+        int writesBeforeRefusal = corrupted.WriteBatches.Count;
+        ThrowsAny<Exception>(() => corruptedBackend.Reset(F7bsdFan.Cpu));
+        Equal(writesBeforeRefusal, corrupted.WriteBatches.Count);
+
+        corrupted.SetCpuBytes(F7bsdCpuPolicy.ToMutableBytes(b1));
+        corruptedBackend.Reset(F7bsdFan.Cpu);
+        corruptedBackend.Dispose();
+        True(corrupted.Disposed);
     }
 
     private static void CpuPreconditionDriftWritesNothing()
@@ -985,16 +1317,166 @@ internal static class Program
         driftBackend.Dispose();
     }
 
-    private static void CpuZeroPreservesOemPolicy()
+    private static void CpuZeroUsesEcThermalTail()
     {
         FakeTransport transport = new();
+        byte[] b1 = transport.CpuBytes();
         PawnIoF7bsdBackend backend = CreateBackend(transport);
         backend.Initialize();
         transport.SetByte(0x0309, 120);
         transport.SetByte(0x0888, 120);
         Equal((byte)0, backend.Set(F7bsdFan.Cpu, 0));
         AssertCpuPolicy(transport, 0);
+        False(transport.CpuBytes().SequenceEqual(b1));
+
+        F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(0);
+        Equal(10, F7bsdCpuPolicy.EvaluateTable(target, 30, cooling: false));
+        True(F7bsdCpuPolicy.EvaluateTable(target, 30, cooling: false) <
+            F7bsdCpuPolicy.EvaluateTable(
+                F7bsdCpuPolicy.GetB1MutableStates(),
+                30,
+                cooling: false));
         backend.Dispose();
+        SequenceEqual(b1, transport.CpuBytes());
+    }
+
+    private static void CpuMutationRateLimitAndCoalescing()
+    {
+        FakeClock clock = new();
+        clock.Set(TimeSpan.FromSeconds(100));
+        FakeTransport transport = new();
+        PawnIoF7bsdBackend backend = CreateBackend(transport, clock);
+        backend.Initialize();
+
+        Equal((byte)17, backend.Set(F7bsdFan.Cpu, 17));
+        AssertCpuPolicy(transport, 17);
+        int reads = transport.ReadBatches.Count;
+        int writes = transport.WriteBatches.Count;
+
+        clock.Advance(TimeSpan.FromSeconds(1) - TimeSpan.FromTicks(1));
+        Equal((byte)17, backend.Set(F7bsdFan.Cpu, 31));
+        Equal(reads, transport.ReadBatches.Count);
+        Equal(writes, transport.WriteBatches.Count);
+        AssertCpuPolicy(transport, 17);
+
+        // A single suppressed edge-triggered request is retained and applied
+        // by the next telemetry tick at the exact quiet-interval boundary.
+        clock.Advance(TimeSpan.FromTicks(1));
+        F7bsdTelemetry applied31 = backend.ReadTelemetry();
+        Equal<byte?>((byte)31, applied31.CpuAppliedCode);
+        True(transport.ReadBatches.Count > reads);
+        True(transport.WriteBatches.Count > writes);
+        AssertCpuPolicy(transport, 31);
+
+        reads = transport.ReadBatches.Count;
+        writes = transport.WriteBatches.Count;
+        Equal((byte)31, backend.Set(F7bsdFan.Cpu, 41));
+        Equal(reads, transport.ReadBatches.Count);
+        Equal(writes, transport.WriteBatches.Count);
+        clock.Advance(TimeSpan.FromSeconds(1) - TimeSpan.FromTicks(1));
+        Equal((byte)31, backend.Set(F7bsdFan.Cpu, 40));
+        Equal(reads, transport.ReadBatches.Count);
+        Equal(writes, transport.WriteBatches.Count);
+
+        // At the exact one-second boundary the current call wins; no stale
+        // suppressed request is queued for later application.
+        clock.Advance(TimeSpan.FromTicks(1));
+        Equal((byte)41, backend.Set(F7bsdFan.Cpu, 41));
+        AssertCpuPolicy(transport, 41);
+
+        clock.Advance(TimeSpan.FromSeconds(1));
+        Equal((byte)0, backend.Set(F7bsdFan.Cpu, 0));
+        AssertCpuPolicy(transport, 0);
+        reads = transport.ReadBatches.Count;
+        writes = transport.WriteBatches.Count;
+
+        // Equivalent codes update the confirmed semantic code without a
+        // mutation, and that confirmed value is returned while a later table
+        // change remains inside the rate-limit window.
+        Equal((byte)10, backend.Set(F7bsdFan.Cpu, 10));
+        Equal(reads, transport.ReadBatches.Count);
+        Equal(writes, transport.WriteBatches.Count);
+        Equal((byte)10, backend.Set(F7bsdFan.Cpu, 20));
+        Equal(reads, transport.ReadBatches.Count);
+        Equal(writes, transport.WriteBatches.Count);
+        AssertCpuPolicy(transport, 10);
+        clock.Advance(TimeSpan.FromSeconds(1));
+        Equal<byte?>((byte)20, backend.ReadTelemetry().CpuAppliedCode);
+        AssertCpuPolicy(transport, 20);
+
+        reads = transport.ReadBatches.Count;
+        writes = transport.WriteBatches.Count;
+        clock.Set(TimeSpan.FromSeconds(50));
+        Equal((byte)20, backend.Set(F7bsdFan.Cpu, 30));
+        Equal(reads, transport.ReadBatches.Count);
+        Equal(writes, transport.WriteBatches.Count);
+        AssertCpuPolicy(transport, 20);
+
+        // A bad monotonic clock freezes the last confirmed table rather than
+        // faulting Fan Control or permitting an unthrottled EC mutation.
+        clock.Set(TimeSpan.FromSeconds(500));
+        Equal<byte?>((byte)20, backend.ReadTelemetry().CpuAppliedCode);
+        AssertCpuPolicy(transport, 20);
+        backend.Reset(F7bsdFan.Cpu);
+        SequenceEqual(
+            F7bsdCpuPolicy.GetB1MutableStates(),
+            F7bsdCpuPolicy.FromMutableBytes(transport.CpuBytes()));
+        backend.Dispose();
+    }
+
+    private static void CpuTimingFaultsFreezeConfirmedTable()
+    {
+        foreach (bool throwElapsed in new[] { false, true })
+        {
+            FakeClock clock = new();
+            FakeTransport transport = new();
+            PawnIoF7bsdBackend backend = new(
+                static () => ExactHost,
+                () => transport,
+                clock.Timestamp,
+                (start, end) => throwElapsed
+                    ? throw new IOException("Expected elapsed-time failure.")
+                    : TimeSpan.FromTicks(start - end),
+                clock.Sleep);
+            backend.Initialize();
+            Equal((byte)17, backend.Set(F7bsdFan.Cpu, 17));
+            int writes = transport.WriteBatches.Count;
+            clock.Advance(TimeSpan.FromSeconds(1));
+
+            Equal((byte)17, backend.Set(F7bsdFan.Cpu, 31));
+            Equal(writes, transport.WriteBatches.Count);
+            Equal<byte?>((byte)17, backend.ReadTelemetry().CpuAppliedCode);
+            AssertCpuPolicy(transport, 17);
+            backend.Reset(F7bsdFan.Cpu);
+            SequenceEqual(
+                F7bsdCpuPolicy.GetB1MutableStates(),
+                F7bsdCpuPolicy.FromMutableBytes(transport.CpuBytes()));
+            backend.Dispose();
+        }
+
+        FakeClock timestampClock = new();
+        FakeTransport timestampTransport = new();
+        bool timestampFails = false;
+        PawnIoF7bsdBackend timestampBackend = new(
+            static () => ExactHost,
+            () => timestampTransport,
+            () => timestampFails
+                ? throw new IOException("Expected timestamp failure.")
+                : timestampClock.Timestamp(),
+            static (start, end) => TimeSpan.FromTicks(end - start),
+            timestampClock.Sleep);
+        timestampBackend.Initialize();
+        timestampFails = true;
+        Equal((byte)17, timestampBackend.Set(F7bsdFan.Cpu, 17));
+        int timestampWrites = timestampTransport.WriteBatches.Count;
+        Equal((byte)17, timestampBackend.Set(F7bsdFan.Cpu, 31));
+        Equal(timestampWrites, timestampTransport.WriteBatches.Count);
+        AssertCpuPolicy(timestampTransport, 17);
+        timestampBackend.Reset(F7bsdFan.Cpu);
+        SequenceEqual(
+            F7bsdCpuPolicy.GetB1MutableStates(),
+            F7bsdCpuPolicy.FromMutableBytes(timestampTransport.CpuBytes()));
+        timestampBackend.Dispose();
     }
 
     private static void DuplicateControlRequestsAreCached()
@@ -1104,11 +1586,11 @@ internal static class Program
             Equal(2, container.ControlSensors.Count);
             IPluginControlSensor2 cpu = FindControl(
                 container.ControlSensors,
-                "minisforum.um780xtx.f7bsd.cpu-minimum-v2");
+                "minisforum.um780xtx.f7bsd.cpu-native-v3");
             IPluginControlSensor2 system = FindControl(
                 container.ControlSensors,
                 "minisforum.um780xtx.f7bsd.system-raw-v2");
-            Equal("UM780 XTX CPU Fan Minimum (OEM Floor)", cpu.Name);
+            Equal("UM780 XTX CPU Fan Target (EC Thermal Tail)", cpu.Name);
             Equal("UM780 XTX System Fan Raw Target", system.Name);
             Equal(
                 $"{plugin.Name}/minisforum.um780xtx.f7bsd.fan1",
@@ -1169,6 +1651,97 @@ internal static class Program
         {
             plugin.Close();
         }
+    }
+
+    private static void PluginReportsCoalescedCpuTelemetryConfirmation()
+    {
+        FakeClock clock = new();
+        FakeTransport transport = new();
+        PawnIoF7bsdBackend backend = CreateBackend(transport, clock);
+        UM780XTXPlugin plugin = new(() => backend);
+        FakeContainer container = new();
+        try
+        {
+            plugin.Initialize();
+            plugin.Load(container);
+            IPluginControlSensor2 cpu = FindControl(
+                container.ControlSensors,
+                "minisforum.um780xtx.f7bsd.cpu-native-v3");
+
+            cpu.Set(F7bsdProfile.ToPercentage(17));
+            Equal<float?>(F7bsdProfile.ToPercentage(17), cpu.Value);
+            cpu.Set(F7bsdProfile.ToPercentage(31));
+            Equal<float?>(F7bsdProfile.ToPercentage(17), cpu.Value);
+            AssertCpuPolicy(transport, 17);
+
+            clock.Advance(TimeSpan.FromSeconds(1));
+            plugin.Update();
+            Equal<float?>(F7bsdProfile.ToPercentage(31), cpu.Value);
+            AssertCpuPolicy(transport, 31);
+        }
+        finally
+        {
+            plugin.Close();
+        }
+        SequenceEqual(
+            F7bsdCpuPolicy.GetB1MutableStates(),
+            F7bsdCpuPolicy.FromMutableBytes(transport.CpuBytes()));
+        True(transport.Disposed);
+    }
+
+    private static void PluginIsolatesDeferredCpuControlFailure()
+    {
+        FakeClock clock = new();
+        FakeTransport transport = new();
+        PawnIoF7bsdBackend backend = CreateBackend(transport, clock);
+        FakeLogger logger = new();
+        UM780XTXPlugin plugin = new(() => backend, logger);
+        FakeContainer container = new();
+        IPluginControlSensor2? system = null;
+        try
+        {
+            plugin.Initialize();
+            plugin.Load(container);
+            IPluginControlSensor2 cpu = FindControl(
+                container.ControlSensors,
+                "minisforum.um780xtx.f7bsd.cpu-native-v3");
+            system = FindControl(
+                container.ControlSensors,
+                "minisforum.um780xtx.f7bsd.system-raw-v2");
+
+            cpu.Set(F7bsdProfile.ToPercentage(17));
+            cpu.Set(F7bsdProfile.ToPercentage(31));
+            transport.FailAfterIndividualWriteCalls[2] = 1;
+            clock.Advance(TimeSpan.FromSeconds(1));
+            plugin.Update();
+
+            Equal<float?>(null, cpu.Value);
+            Equal<float?>(null, Find(
+                container.FanSensors,
+                "minisforum.um780xtx.f7bsd.fan1").Value);
+            SequenceEqual(
+                F7bsdCpuPolicy.GetB1MutableStates(),
+                F7bsdCpuPolicy.FromMutableBytes(transport.CpuBytes()));
+            True(logger.Messages.Any(message => message.Contains(
+                "deferred CPU control failed",
+                StringComparison.Ordinal)));
+            False(logger.Messages.Any(message => message.Contains(
+                "telemetry read failed",
+                StringComparison.Ordinal)));
+
+            int writesAfterCpuFault = transport.WriteBatches.Count;
+            cpu.Set(F7bsdProfile.ToPercentage(41));
+            Equal(writesAfterCpuFault, transport.WriteBatches.Count);
+
+            system.Set(F7bsdProfile.ToPercentage(30));
+            Equal<float?>(F7bsdProfile.ToPercentage(30), system.Value);
+        }
+        finally
+        {
+            system?.Reset();
+            plugin.Close();
+        }
+        True(transport.Disposed);
     }
 
     private static void PluginTelemetryErrorClearsStaleValues()
@@ -1235,7 +1808,7 @@ internal static class Program
             plugin.Load(container);
             IPluginControlSensor2 cpu = FindControl(
                 container.ControlSensors,
-                "minisforum.um780xtx.f7bsd.cpu-minimum-v2");
+                "minisforum.um780xtx.f7bsd.cpu-native-v3");
             cpu.Set(50f);
             Equal<float?>(null, cpu.Value);
             Equal(1, backend.SetCalls.Count);
@@ -1335,10 +1908,40 @@ internal static class Program
         True(transport.Disposed);
     }
 
+    private static F7bsdCpuRowState[] ApplyCpuTransitionSteps(
+        ReadOnlySpan<F7bsdCpuRowState> source,
+        ReadOnlySpan<F7bsdCpuTransitionStep> steps)
+    {
+        Equal(F7bsdCpuPolicy.NormalRowCount, source.Length);
+        F7bsdCpuRowState[] current = source.ToArray();
+        foreach (F7bsdCpuTransitionStep step in steps)
+        {
+            True(step.RowIndex >= 0 &&
+                step.RowIndex < F7bsdCpuPolicy.NormalRowCount);
+            F7bsdCpuRowState previous = current[step.RowIndex];
+            F7bsdCpuRowState next = step.ResultingState;
+            bool baseChanged = previous.Base != next.Base;
+            bool slopeChanged = previous.Slope != next.Slope;
+            True(baseChanged ^ slopeChanged);
+            Equal(
+                baseChanged
+                    ? new EcWrite(
+                        CpuBaseAddresses[step.RowIndex],
+                        next.Base)
+                    : new EcWrite(
+                        CpuSlopeAddresses[step.RowIndex],
+                        next.Slope),
+                step.Write);
+            True(F7bsdCpuPolicy.IsCrashSafe(step.RowIndex, next));
+            current[step.RowIndex] = next;
+        }
+        return current;
+    }
+
     private static void AssertCpuPolicy(FakeTransport transport, byte code)
     {
         SequenceEqual(
-            F7bsdCpuPolicy.ToMutableBytes(F7bsdCpuPolicy.CompileFloor(code)),
+            F7bsdCpuPolicy.ToMutableBytes(F7bsdCpuPolicy.CompileTarget(code)),
             transport.CpuBytes());
     }
 
@@ -1801,6 +2404,8 @@ internal static class Program
 
         internal HashSet<int> FailAfterWriteCalls { get; } = [];
 
+        internal Dictionary<int, int> FailAfterIndividualWriteCalls { get; } = [];
+
         internal int? FailAfterIndividualWriteInNextBatch { get; set; }
 
         internal bool AutoSystemOwnership { get; set; } = true;
@@ -1918,7 +2523,12 @@ internal static class Program
             {
                 throw new IOException($"Expected fake pre-write failure {writeCalls}.");
             }
-            int? failAfterIndividual = FailAfterIndividualWriteInNextBatch;
+            int? failAfterIndividual =
+                FailAfterIndividualWriteCalls.TryGetValue(
+                    writeCalls,
+                    out int scheduledIndividualFailure)
+                    ? scheduledIndividualFailure
+                    : FailAfterIndividualWriteInNextBatch;
             FailAfterIndividualWriteInNextBatch = null;
             List<EcWrite> applied = [];
             foreach (EcWrite write in copy)

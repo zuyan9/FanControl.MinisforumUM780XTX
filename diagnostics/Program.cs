@@ -15,12 +15,14 @@ return args switch
         parsed is >= 1 and <= 10 => Run("plugin", () => Plugin(parsed)),
     ["cpu", string code, string seconds]
         when byte.TryParse(code, out byte parsedCode) &&
-        parsedCode is 0 or 28 or 29 &&
+        parsedCode is 10 or 12 or 14 or 16 or 18 &&
         int.TryParse(seconds, out int parsedSeconds) &&
         parsedSeconds is >= 1 and <= 30 =>
             Run($"cpu-{parsedCode}", () => Cpu(parsedCode, parsedSeconds)),
-    ["cpu-step"] => Run("cpu-step-28-29-28", CpuStep),
-    ["plugin-cpu"] => Run("plugin-cpu-28", PluginCpu),
+    ["cpu-step"] => Run("cpu-step-low-v3", CpuStep),
+    ["cpu-soak"] => Run("cpu-soak-10-120", () => Cpu(10, 120)),
+    ["plugin-cpu"] => Run("plugin-cpu-18", PluginCpu),
+    ["plugin-cpu-step"] => Run("plugin-cpu-step-v3", PluginCpuStep),
     ["plugin-system"] => Run("plugin-system-30", PluginSystem),
     ["plugin-combined"] => Run("plugin-combined-28-30", PluginCombined),
     ["system", string code, string seconds]
@@ -160,25 +162,35 @@ static void Cpu(byte code, int seconds)
         backend.Initialize();
         initialized = true;
         F7bsdTelemetry before = backend.ReadTelemetry();
-        if (code != 0 && before.CpuTemperatureC >= 70)
+        if (before.CpuTemperatureC is < 1 or >= 70)
         {
             throw new InvalidOperationException(
-                $"CPU is {before.CpuTemperatureC} C; nonzero live test requires <70 C.");
+                $"CPU is {before.CpuTemperatureC} C; live test requires a " +
+                "plausible value below 70 C.");
         }
 
+        F7bsdCpuRowState[] baseline = F7bsdCpuPolicy.GetB1MutableStates();
+        F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(code);
+        F7bsdCpuTransitionStep[] plan =
+            F7bsdCpuPolicy.PlanTransition(baseline, target);
         Console.WriteLine(
             $"Before: CPU {before.CpuTemperatureC} C / {before.CpuFanRpm} RPM; " +
-            $"applying OEM-floor code {code} ({code * 100} RPM minimum)");
+            $"applying native target code {code} ({code * 100} RPM) through " +
+            "74 C; the EC thermal tail reaches code 51 at 93 C");
         Console.WriteLine(
-            $"Planned CPU policy writes: {F7bsdCpuPolicy.PlanTransition(0, code).Length}");
+            $"Planned CPU policy writes from exact B1: {plan.Length}");
+        Stopwatch mutation = Stopwatch.StartNew();
         byte applied = backend.Set(F7bsdFan.Cpu, code);
+        mutation.Stop();
         if (applied != code)
         {
             throw new IOException($"Backend returned code {applied}; expected {code}.");
         }
         Console.WriteLine(
+            $"CPU transaction completed in {mutation.Elapsed.TotalMilliseconds:F1} ms.");
+        Console.WriteLine(
             "Expected mutable CPU table: " +
-            Hex(F7bsdCpuPolicy.ToMutableBytes(F7bsdCpuPolicy.CompileFloor(code))));
+            Hex(F7bsdCpuPolicy.ToMutableBytes(target)));
 
         for (int index = 0; index < seconds; index++)
         {
@@ -187,7 +199,10 @@ static void Cpu(byte code, int seconds)
                 Thread.Sleep(TimeSpan.FromSeconds(1));
             }
             F7bsdTelemetry telemetry = backend.ReadTelemetry();
-            if (telemetry.CpuTemperatureC >= 80 || telemetry.CpuFanRpm == 0)
+            if (telemetry.CpuTemperatureC >= 75 ||
+                telemetry.CpuFanRpm == 0 ||
+                telemetry.CpuFanRpm > 6_000 ||
+                (index >= 2 && telemetry.CpuFanRpm < 500))
             {
                 throw new IOException(
                     $"CPU live-test abort at {telemetry.CpuTemperatureC} C / " +
@@ -235,17 +250,23 @@ static void CpuStep()
                 $"CPU is {before.CpuTemperatureC} C; step test requires <70 C.");
         }
 
-        foreach (byte code in new byte[] { 28, 29, 28 })
+        F7bsdCpuRowState[] current = F7bsdCpuPolicy.GetB1MutableStates();
+        foreach (byte code in new byte[] { 18, 16, 14, 12, 10, 12, 18 })
         {
+            F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(code);
             Console.WriteLine(
-                $"Set code {code}; expected writes from current policy are bounded to " +
-                $"{F7bsdCpuPolicy.MaximumWritesPerRow} per row.");
+                $"Set code {code}; planned writes from the current table: " +
+                $"{F7bsdCpuPolicy.PlanTransition(current, target).Length}.");
             backend.Set(F7bsdFan.Cpu, code);
-            for (int sample = 0; sample < 3; sample++)
+            current = target;
+            for (int sample = 0; sample < 5; sample++)
             {
                 Thread.Sleep(TimeSpan.FromSeconds(1));
                 F7bsdTelemetry telemetry = backend.ReadTelemetry();
-                if (telemetry.CpuTemperatureC >= 80 || telemetry.CpuFanRpm == 0)
+                if (telemetry.CpuTemperatureC >= 75 ||
+                    telemetry.CpuFanRpm == 0 ||
+                    telemetry.CpuFanRpm > 6_000 ||
+                    (sample >= 2 && telemetry.CpuFanRpm < 500))
                 {
                     throw new IOException(
                         $"CPU step-test abort at {telemetry.CpuTemperatureC} C / " +
@@ -362,10 +383,10 @@ static void PluginCpu()
         plugin.Initialize();
         plugin.Load(container);
         cpu = (IPluginControlSensor2)container.ControlSensors.Single(control =>
-            control.Id.EndsWith("cpu-minimum-v2", StringComparison.Ordinal));
-        if (!cpu.Id.EndsWith("cpu-minimum-v2", StringComparison.Ordinal))
+            control.Id.EndsWith("cpu-native-v3", StringComparison.Ordinal));
+        if (!cpu.Id.EndsWith("cpu-native-v3", StringComparison.Ordinal))
         {
-            throw new InvalidOperationException("The staged CPU control ID is not v2.");
+            throw new InvalidOperationException("The staged CPU control ID is not v3.");
         }
         float temperature = Value(container.TempSensors, "cpu-temperature");
         if (temperature >= 70)
@@ -374,11 +395,11 @@ static void PluginCpu()
                 $"CPU is {temperature} C; plugin control test requires <70 C.");
         }
 
-        float requested = F7bsdProfile.ToPercentage(28);
+        float requested = F7bsdProfile.ToPercentage(18);
         cpu.Set(requested);
         if (cpu.Value != requested)
         {
-            throw new IOException("Plugin did not report the verified code-28 floor.");
+            throw new IOException("Plugin did not report the verified code-18 target.");
         }
         for (int index = 0; index < 10; index++)
         {
@@ -390,7 +411,92 @@ static void PluginCpu()
             Console.WriteLine(
                 $"{index + 1}: CPU {Value(container.TempSensors, "cpu-temperature")} C / " +
                 $"{Value(container.FanSensors, "fan1")} RPM; " +
-                $"control {cpu.Value:F2}% (code 28)");
+                $"control {cpu.Value:F2}% (code 18)");
+        }
+    }
+    finally
+    {
+        cpu?.Reset();
+        plugin.Close();
+    }
+}
+
+static void PluginCpuStep()
+{
+    UM780XTXPlugin plugin = new(new ProbeLogger());
+    ProbeContainer container = new();
+    IPluginControlSensor2? cpu = null;
+    try
+    {
+        plugin.Initialize();
+        plugin.Load(container);
+        cpu = (IPluginControlSensor2)container.ControlSensors.Single(control =>
+            control.Id.EndsWith("cpu-native-v3", StringComparison.Ordinal));
+        if (Value(container.TempSensors, "cpu-temperature") >= 70)
+        {
+            throw new InvalidOperationException(
+                "CPU plugin-step test requires a temperature below 70 C.");
+        }
+
+        cpu.Set(F7bsdProfile.ToPercentage(18));
+        foreach (byte code in new byte[] { 16, 14, 12, 10 })
+        {
+            cpu.Set(F7bsdProfile.ToPercentage(code));
+        }
+        if (cpu.Value != F7bsdProfile.ToPercentage(18))
+        {
+            throw new IOException(
+                "A suppressed CPU request was reported before hardware confirmation.");
+        }
+
+        Thread.Sleep(TimeSpan.FromMilliseconds(1_100));
+        plugin.Update();
+        if (cpu.Value != F7bsdProfile.ToPercentage(10))
+        {
+            throw new IOException("The coalesced code-10 request was not confirmed.");
+        }
+        float downTemperature = Value(container.TempSensors, "cpu-temperature");
+        float downRpm = Value(container.FanSensors, "fan1");
+        if (downTemperature >= 75 || downRpm == 0 || downRpm > 6_000)
+        {
+            throw new IOException(
+                $"Plugin coalesced-down abort at {downTemperature} C / " +
+                $"{downRpm} RPM.");
+        }
+        Console.WriteLine(
+            $"Coalesced down: CPU {downTemperature} C / {downRpm} RPM / " +
+            "code 10 confirmed.");
+
+        foreach (byte code in new byte[] { 12, 14, 16, 18 })
+        {
+            cpu.Set(F7bsdProfile.ToPercentage(code));
+        }
+        if (cpu.Value != F7bsdProfile.ToPercentage(10))
+        {
+            throw new IOException(
+                "A suppressed CPU request was reported before hardware confirmation.");
+        }
+
+        Thread.Sleep(TimeSpan.FromMilliseconds(1_100));
+        plugin.Update();
+        if (cpu.Value != F7bsdProfile.ToPercentage(18))
+        {
+            throw new IOException("The coalesced code-18 request was not confirmed.");
+        }
+
+        for (int sample = 0; sample < 5; sample++)
+        {
+            Thread.Sleep(TimeSpan.FromSeconds(1));
+            plugin.Update();
+            float temperature = Value(container.TempSensors, "cpu-temperature");
+            float rpm = Value(container.FanSensors, "fan1");
+            if (temperature >= 75 || rpm < 500 || rpm > 6_000)
+            {
+                throw new IOException(
+                    $"Plugin CPU step abort at {temperature} C / {rpm} RPM.");
+            }
+            Console.WriteLine(
+                $"{sample + 1}: CPU {temperature} C / {rpm} RPM / code 18 confirmed.");
         }
     }
     finally
@@ -463,7 +569,7 @@ static void PluginCombined()
         plugin.Initialize();
         plugin.Load(container);
         cpu = (IPluginControlSensor2)container.ControlSensors.Single(control =>
-            control.Id.EndsWith("cpu-minimum-v2", StringComparison.Ordinal));
+            control.Id.EndsWith("cpu-native-v3", StringComparison.Ordinal));
         system = (IPluginControlSensor2)container.ControlSensors.Single(control =>
             control.Id.EndsWith("system-raw-v2", StringComparison.Ordinal));
         if (Value(container.TempSensors, "cpu-temperature") >= 70 ||
@@ -536,7 +642,8 @@ static int Usage()
 {
     Console.Error.WriteLine(
         "Usage: diagnostics identity|profile|telemetry [1..10]|stock|" +
-        "plugin [1..10]|cpu {0|28|29} {1..30 seconds}|cpu-step|plugin-cpu|" +
+        "plugin [1..10]|cpu {10|12|14|16|18} {1..30 seconds}|cpu-step|cpu-soak|" +
+        "plugin-cpu|plugin-cpu-step|" +
         "system {30|51} {1..30 seconds}|plugin-system|plugin-combined");
     return 2;
 }

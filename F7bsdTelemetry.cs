@@ -5,7 +5,8 @@ internal sealed record F7bsdTelemetry(
     int SystemFanRpm,
     int CpuTemperatureC,
     int SystemTemperatureC,
-    byte? SystemAppliedCode = null);
+    byte? SystemAppliedCode = null,
+    byte? CpuAppliedCode = null);
 
 internal static class F7bsdTelemetryDecoder
 {
