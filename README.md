@@ -86,6 +86,8 @@ The narrow user-mode guard does not replace Fan Control's policy:
   poll;
 - raw system temperature comes from `0x0305`, never from the sentinel-backed
   effective byte;
+- firmware-owned telemetry omits the three system-ownership-only bytes; they
+  are added to each sample only while raw system control is active;
 - a low initial target is refused when raw temperature is invalid or at least
   70 C; code `51` remains available;
 - while owned, each telemetry update verifies both sentinel bytes and the
@@ -149,6 +151,12 @@ GPU/platform fault cannot recur. Save work and test attended. Live system code
 sleep/resume, multi-hour operation, and sustained high-temperature CPU-tail
 operation have not been exercised on Windows.
 
+The extracted BIOS 1.06 EC image and the firmware routines behind both controls
+are documented in [UM780 XTX EC firmware analysis](docs/EC_FIRMWARE_ANALYSIS.md).
+That static analysis validates the CPU row arithmetic and system sentinel
+semantics, while separating them from the remaining raw indexed-port transport
+risk.
+
 ## Build and test
 
 Install the .NET 10 SDK and Fan Control, then run:
@@ -169,10 +177,10 @@ dotnet build -c Release `
 The 46-test offline suite checks every v3 CPU request over both thermal paths, all
 `52 x 52 x 7` compiled-policy transitions, one-second mutation coalescing,
 zero-I/O equivalent requests, interruption of both the original write and its
-certified recovery, non-prefix rejection, exact B1 reset, EC address allowlists,
-parking and poisoning behavior, bounded system ownership/release, thermal and
-timing boundaries, drift, cleanup retry, telemetry ordering, and plugin
-exception containment.
+direct exact-prefix recovery, non-prefix rejection, exact B1 reset, EC address
+allowlists, parking and poisoning behavior, bounded system ownership/release,
+thermal and timing boundaries, drift, cleanup retry, telemetry ordering, and
+plugin exception containment.
 
 ## Hardware validation status
 
