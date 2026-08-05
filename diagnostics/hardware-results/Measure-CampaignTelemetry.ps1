@@ -4,7 +4,7 @@ param(
     [string] $Path,
 
     [string] $CpuControlId =
-        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4'
+        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-raw-v1'
 )
 
 $ErrorActionPreference = 'Stop'

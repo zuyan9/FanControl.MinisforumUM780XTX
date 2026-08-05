@@ -9,3 +9,5 @@ release-assets/
 diagnostics/hardware-results/*/*
 !diagnostics/hardware-results/*/CAMPAIGN.md
 !diagnostics/hardware-results/*/RESULTS.json
+diagnostics/hardware-results/*.log
+diagnostics/hardware-results/*-status.json

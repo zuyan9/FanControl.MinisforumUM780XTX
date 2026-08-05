@@ -62,13 +62,32 @@ const string CpuTemperatureSensorId =
 const string SystemTemperatureSensorId =
     "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-temperature";
 const string CpuControlSensorId =
-    "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4";
+    "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-raw-v1";
 const string SystemControlSensorId =
     "Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-raw-v2";
 const string CpuPackageTemperatureSensorId = "/amdcpu/0/temperature/2";
+const string CpuPackagePowerSensorId = "/amdcpu/0/power/0";
+const string CpuAverageEffectiveClockSensorId = "/amdcpu/0/clock/2";
+const string CpuTotalLoadSensorId = "/amdcpu/0/load/0";
 const string GpuTemperatureSensorId = "/gpu-amd/0/temperature/4";
+const string GpuCorePowerSensorId = "/gpu-amd/0/power/0";
+const string GpuSocPowerSensorId = "/gpu-amd/0/power/2";
+const string GpuCoreClockSensorId = "/gpu-amd/0/clock/0";
+const string GpuSocClockSensorId = "/gpu-amd/0/clock/1";
+const string GpuCoreLoadSensorId = "/gpu-amd/0/load/0";
+const string GpuD3dLoadSensorId = "/gpu-amd/0/load/2";
+const string GpuDedicatedMemorySensorId = "/gpu-amd/0/smalldata/3";
+const string GpuSharedMemorySensorId = "/gpu-amd/0/smalldata/6";
 const string Dimm0TemperatureSensorId = "/memory/dimm/0/temperature/0";
 const string Dimm1TemperatureSensorId = "/memory/dimm/1/temperature/0";
+string[] cpuCoreEffectiveClockSensorIds =
+    Enumerable.Range(0, 8)
+        .Select(core => $"/amdcpu/0/clock/{4 + core * 2}")
+        .ToArray();
+string[] cpuCorePowerSensorIds =
+    Enumerable.Range(1, 8)
+        .Select(core => $"/amdcpu/0/power/{core}")
+        .ToArray();
 string[] monitoredSensorIds =
 [
     CpuRpmSensorId,
@@ -78,7 +97,20 @@ string[] monitoredSensorIds =
     CpuControlSensorId,
     SystemControlSensorId,
     CpuPackageTemperatureSensorId,
+    CpuPackagePowerSensorId,
+    CpuAverageEffectiveClockSensorId,
+    CpuTotalLoadSensorId,
+    .. cpuCoreEffectiveClockSensorIds,
+    .. cpuCorePowerSensorIds,
     GpuTemperatureSensorId,
+    GpuCorePowerSensorId,
+    GpuSocPowerSensorId,
+    GpuCoreClockSensorId,
+    GpuSocClockSensorId,
+    GpuCoreLoadSensorId,
+    GpuD3dLoadSensorId,
+    GpuDedicatedMemorySensorId,
+    GpuSharedMemorySensorId,
     Dimm0TemperatureSensorId,
     Dimm1TemperatureSensorId,
 ];
