@@ -4,6 +4,9 @@ A small, hardware-specific [Fan Control](https://github.com/Rem0o/FanControl.Rel
 plugin for the Minisforum UM780 XTX. It exposes the embedded controller's CPU
 and system fan RPM, raw temperatures, and native closed-loop fan targets.
 
+<img width="400" alt="image" src="https://github.com/user-attachments/assets/6715b427-6425-4321-a3f6-5a8bae6a38e7" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/33ade8d4-c7ec-4bf6-839c-daf673d00b4e" />
+
 ## Compatibility
 
 The plugin loads only on the tested hardware profile:
