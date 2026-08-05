@@ -73,8 +73,8 @@ dotnet build -c Release `
 
 Pushes and pull requests to `master` are built automatically. To publish a
 release, run the **Build and release** workflow from `master` and enter an
-unused `X.Y.Z` version. It verifies the binary version, uploads DLL and ZIP
-artifacts, and creates the matching `vX.Y.Z` GitHub release.
+unused `X.Y.Z` version. It verifies the binary version, uploads the plugin ZIP,
+and creates the matching `vX.Y.Z` GitHub release.
 
 ## Recovery limitation
 

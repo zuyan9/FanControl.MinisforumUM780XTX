@@ -128,12 +128,10 @@ jobs:
           $assetDir = Join-Path $env:RUNNER_TEMP "release-assets"
           $sourceDll = Join-Path $env:GITHUB_WORKSPACE `
               "bin\Release\net10.0-windows\FanControl.MinisforumUM780XTX.dll"
-          $assetDll = Join-Path $assetDir "FanControl.MinisforumUM780XTX.dll"
           $archive = Join-Path $assetDir "FanControl.MinisforumUM780XTX.zip"
 
           New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
-          Copy-Item -LiteralPath $sourceDll -Destination $assetDll -Force
-          Compress-Archive -LiteralPath $assetDll -DestinationPath $archive -Force
+          Compress-Archive -LiteralPath $sourceDll -DestinationPath $archive -Force
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
@@ -151,7 +149,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: FanControl.MinisforumUM780XTX-${{ steps.version.outputs.version }}
-          path: ${{ runner.temp }}/release-assets/*
+          path: ${{ runner.temp }}/release-assets/FanControl.MinisforumUM780XTX.zip
           if-no-files-found: error
 
   release:
@@ -196,7 +194,6 @@ jobs:
           }
 
           gh release create $releaseTag `
-              .\release-assets\FanControl.MinisforumUM780XTX.dll `
               .\release-assets\FanControl.MinisforumUM780XTX.zip `
               --repo $env:GH_REPO `
               --target $env:RELEASE_TARGET `
