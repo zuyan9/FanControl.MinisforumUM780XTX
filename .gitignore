@@ -1,13 +1,2 @@
 bin/
 obj/
-artifacts/
-release-assets/
-
-# Local hardware-campaign evidence can contain machine-specific paths,
-# configuration, logs, dumps, and deployed binaries. Keep only the curated
-# summaries in version control.
-diagnostics/hardware-results/*/*
-!diagnostics/hardware-results/*/CAMPAIGN.md
-!diagnostics/hardware-results/*/RESULTS.json
-diagnostics/hardware-results/*.log
-diagnostics/hardware-results/*-status.json
