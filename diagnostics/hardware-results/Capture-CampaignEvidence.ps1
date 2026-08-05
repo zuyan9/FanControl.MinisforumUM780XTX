@@ -90,7 +90,7 @@ $configFileName = if ($cache) {
 $configPath = Join-Path $FanControlDirectory `
     "Configurations\$configFileName"
 $logPath = Join-Path $FanControlDirectory 'log.txt'
-$dumpRoot = 'C:\Windows\LiveKernelReports'
+$dumpRoot = Join-Path $env:SystemRoot 'LiveKernelReports'
 $localDumpRoot = Join-Path $env:LOCALAPPDATA 'CrashDumps'
 $pawnIoDriver = Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
     Where-Object Name -eq 'PawnIO' |
@@ -100,7 +100,7 @@ $componentPaths = @(
     (Join-Path $FanControlDirectory 'FanControl.IPC.dll'),
     (Join-Path $FanControlDirectory 'FanControl.Plugins.dll'),
     (Join-Path $FanControlDirectory 'LibreHardwareMonitorLib.dll'),
-    'C:\Program Files\PawnIO\PawnIOLib.dll',
+    (Join-Path $env:ProgramFiles 'PawnIO\PawnIOLib.dll'),
     ($pawnIoDriver.PathName -replace '^\\SystemRoot', $env:SystemRoot)
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 

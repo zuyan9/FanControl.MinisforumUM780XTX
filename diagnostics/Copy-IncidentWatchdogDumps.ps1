@@ -31,10 +31,12 @@ if (-not $principal.IsInRole(
     throw 'Run this read-only collector from an elevated PowerShell session.'
 }
 
+$liveKernelRoot = Join-Path $env:SystemRoot 'LiveKernelReports'
+$watchdogRoot = Join-Path $liveKernelRoot 'WATCHDOG'
 $sources = @(
-    'C:\Windows\LiveKernelReports\WATCHDOG-20260803-1234.dmp',
-    'C:\Windows\LiveKernelReports\WATCHDOG\WATCHDOG-20260803-1759.dmp',
-    'C:\Windows\LiveKernelReports\WATCHDOG\WATCHDOG-20260803-1904.dmp'
+    (Join-Path $liveKernelRoot 'WATCHDOG-20260803-1234.dmp'),
+    (Join-Path $watchdogRoot 'WATCHDOG-20260803-1759.dmp'),
+    (Join-Path $watchdogRoot 'WATCHDOG-20260803-1904.dmp')
 )
 
 $resolvedOutput = [IO.Path]::GetFullPath($OutputDirectory)

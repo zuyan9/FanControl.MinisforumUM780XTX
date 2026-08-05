@@ -239,6 +239,16 @@ platform failure will never recur. A 24-72 hour representative-use soak,
 sleep/resume, forced termination, live system code `0`, and an actual system
 thermal-failsafe trip remain untested.
 
+A follow-up reproduction campaign then exercised 24 acknowledged dynamic CPU
+profile transitions, including 12 consecutive changes during 96.0..98.2% iGPU
+load. Every sequence and exact control readback passed. The longest workload
+was stopped after the completed sequence by its conservative 69 C system guard;
+there was no freeze, black screen, EC deadlock, relevant event, or new dump.
+See the
+[A5 dynamic-control reproduction campaign](diagnostics/hardware-results/2026-08-04-reproduction/CAMPAIGN.md)
+for the raw-wrapper classification, GPU overlap, final restoration, and
+remaining limitations.
+
 ## Recovery and user-mode limit
 
 When Fan Control invokes `Reset` or `Close` (normally on disable, refresh, or an

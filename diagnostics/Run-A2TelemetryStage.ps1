@@ -15,8 +15,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $OutputRoot,
 
-    [string] $FanControlRoot =
-        'C:\Users\Zuyang\Downloads\FanControl_272_net_10_0',
+    [Parameter(Mandatory = $true)]
+    [string] $FanControlRoot,
 
     [ValidateRange(1, 120)]
     [double] $CpuMaximumC = 95,

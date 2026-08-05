@@ -194,7 +194,7 @@ function Invoke-DurableProbe {
 }
 
 function Get-LiveKernelReportInventory {
-    $root = 'C:\Windows\LiveKernelReports'
+    $root = Join-Path $env:SystemRoot 'LiveKernelReports'
     try {
         $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction Stop |
             ForEach-Object {

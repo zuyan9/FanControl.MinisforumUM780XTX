@@ -15,7 +15,7 @@
     "lengthBytes": 87040,
     "sha256": "9E46A71AD017D34ABE9B6C6C3CE210CD4928F97D429E18197F6FEBD689D8F6EA"
   },
-  "rootCause": {
+  "observedPluginDefect": {
     "classification": "responsive EC false selector timeout plus cross-fan fault propagation",
     "oldSelectorLimitMilliseconds": 500,
     "newSelectorLimitMilliseconds": 1500,

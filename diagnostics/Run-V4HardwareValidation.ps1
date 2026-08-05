@@ -29,7 +29,8 @@ function Write-ValidationLog {
 
 function Get-LiveKernelDumpKeys {
     $keys = @{}
-    Get-ChildItem -LiteralPath 'C:\Windows\LiveKernelReports' -Recurse -File `
+    $root = Join-Path $env:SystemRoot 'LiveKernelReports'
+    Get-ChildItem -LiteralPath $root -Recurse -File `
         -ErrorAction SilentlyContinue | ForEach-Object {
             $key = "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)"
             $keys[$key] = $_
