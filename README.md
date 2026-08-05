@@ -71,6 +71,11 @@ dotnet build -c Release `
   -p:Version=0.2.0
 ```
 
+Pushes and pull requests to `master` are built automatically. To publish a
+release, run the **Build and release** workflow from `master` and enter an
+unused `X.Y.Z` version. It verifies the binary version, uploads DLL and ZIP
+artifacts, and creates the matching `vX.Y.Z` GitHub release.
+
 ## Recovery limitation
 
 Disabling a control, refreshing the plugin, or exiting Fan Control normally
