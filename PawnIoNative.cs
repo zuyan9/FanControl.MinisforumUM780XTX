@@ -83,6 +83,14 @@ internal sealed class PawnIoTransport : IDisposable
 
     internal void WriteVerified(EcWrite[] writes) => WriteVerified([], writes);
 
+    internal void WriteCpuVerified(EcWrite[] writes, ReadOnlySpan<byte> baseline)
+    {
+        ArgumentNullException.ThrowIfNull(writes);
+        F7bsdProfile.AssertCpuWritesAllowed(writes, baseline);
+        EnsureIdentityVerified();
+        WriteVerifiedCore([], writes, null);
+    }
+
     internal void WriteVerified(
         EcExpectation[] before,
         EcWrite[] writes,
@@ -93,6 +101,14 @@ internal sealed class PawnIoTransport : IDisposable
         F7bsdProfile.AssertReadsAllowed(before.Select(item => item.Address));
         F7bsdProfile.AssertWritesAllowed(writes);
         EnsureIdentityVerified();
+        WriteVerifiedCore(before, writes, beforeWrites);
+    }
+
+    private void WriteVerifiedCore(
+        EcExpectation[] before,
+        EcWrite[] writes,
+        Action? beforeWrites)
+    {
         RunIsa(() =>
         {
             SelectSlot();

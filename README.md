@@ -16,7 +16,7 @@ The plugin loads only on the tested hardware profile:
 - BIOS `1.06`, EC `0.8`;
 - IT5571 PNP identity `55 71 02`;
 - controller profile `55 71 02 43 14 7f`; and
-- exact stock CPU B1 table with critical row `(51,100,93,0)`.
+- inactive firmware overrides and CPU critical row `(51,100,93,0)`.
 
 It targets Windows x64, .NET 10, Fan Control V272, and PawnIO API 2.0.
 
@@ -35,9 +35,11 @@ Fan Control percentages map linearly to EC codes `0..51`, nominally
 `0..5100 RPM`. There are no plugin-side minimums, curves, thermal promotions,
 or rate limits. Fan Control owns that policy.
 
-CPU control sets the same target in all seven normal B1 temperature rows. The
+CPU control sets the same target in all seven normal temperature rows. The
 plugin never changes the independent critical row, so firmware still requests
-full speed at 94 C and above.
+full speed at 94 C and above. The plugin does not interpret the BIOS fan-profile
+selector; it captures and restores the active table, so both Balance and
+Performance modes are supported.
 
 System control uses the firmware's `0xff` fixed-target handoff. While that
 handoff is active, firmware has no automatic system-temperature fallback. On
@@ -82,8 +84,9 @@ and creates the matching `vX.Y.Z` GitHub release.
 ## Recovery limitation
 
 Disabling a control, refreshing the plugin, or exiting Fan Control normally
-restores the captured CPU B1 table and returns the system fan to firmware.
+restores the captured CPU table and returns the system fan to firmware.
 Force-terminating Fan Control, suspending or crashing Windows, or a complete
 machine freeze can prevent cleanup and leave a raw target in volatile EC RAM.
-After any uncontrolled termination, reboot before reopening Fan Control or
-using another EC utility.
+After any uncontrolled termination, reboot the machine before reopening Fan
+Control or using another EC utility. Restarting or refreshing Fan Control alone
+does not reload the BIOS-selected fan table.
