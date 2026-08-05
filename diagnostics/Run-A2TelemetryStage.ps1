@@ -132,7 +132,7 @@ $cpuTemperatureId =
 $systemTemperatureId =
     'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-temperature'
 $cpuControlId =
-    'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4'
+    'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-raw-v1'
 $systemControlId =
     'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.system-raw-v2'
 $cpuPackageTemperatureId = '/amdcpu/0/temperature/2'

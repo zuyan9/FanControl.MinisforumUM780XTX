@@ -19,13 +19,13 @@ return args switch
         int.TryParse(seconds, out int parsedSeconds) &&
         parsedSeconds is >= 1 and <= 120 =>
             Run($"cpu-{parsedCode}", () => Cpu(parsedCode, parsedSeconds)),
-    ["cpu-step"] => Run("cpu-step-low-v4", CpuStep),
-    ["cpu-stop-start"] => Run("cpu-stop-start-v4", CpuStopStart),
-    ["cpu-zero-load"] => Run("cpu-zero-load-v4", CpuZeroLoad),
+    ["cpu-step"] => Run("cpu-step-low-raw-v1", CpuStep),
+    ["cpu-stop-start"] => Run("cpu-stop-start-raw-v1", CpuStopStart),
+    ["cpu-zero-load"] => Run("cpu-zero-load-raw-v1", CpuZeroLoad),
     ["cpu-soak"] => Run("cpu-soak-10-120", () => Cpu(10, 120)),
     ["plugin-cpu"] => Run("plugin-cpu-18", PluginCpu),
-    ["plugin-cpu-step"] => Run("plugin-cpu-step-v4", PluginCpuStep),
-    ["plugin-cpu-burst"] => Run("plugin-cpu-burst-v4", PluginCpuBurst),
+    ["plugin-cpu-step"] => Run("plugin-cpu-step-raw-v1", PluginCpuStep),
+    ["plugin-cpu-burst"] => Run("plugin-cpu-burst-raw-v1", PluginCpuBurst),
     ["plugin-system"] => Run("plugin-system-30", PluginSystem),
     ["plugin-combined"] => Run("plugin-combined-28-30", PluginCombined),
     ["system", string code, string seconds]
@@ -178,8 +178,9 @@ static void Cpu(byte code, int seconds)
             F7bsdCpuPolicy.PlanTransition(baseline, target);
         Console.WriteLine(
             $"Before: CPU {before.CpuTemperatureC} C / {before.CpuFanRpm} RPM; " +
-            $"applying cool-temperature target code {code} ({code * 100} RPM); " +
-            "the EC thermal tail begins above 66 C and reaches code 51 at 93 C");
+            $"applying fixed subcritical target code {code} " +
+            $"({code * 100} RPM nominal); the untouched critical row reaches " +
+            "code 51 at 94 C");
         Console.WriteLine(
             $"Planned CPU policy writes from exact B1: {plan.Length}");
         Stopwatch mutation = Stopwatch.StartNew();
@@ -452,11 +453,11 @@ static void CpuZeroLoad()
             Console.WriteLine(
                 $"stop {sample}: {telemetry.CpuTemperatureC} C / " +
                 $"{telemetry.CpuFanRpm} RPM / target {state[3]}");
-            if (telemetry.CpuTemperatureC >= 67 || state[3] != 0)
+            if (telemetry.CpuTemperatureC >= 75 || state[3] != 0)
             {
                 backend.Set(F7bsdFan.Cpu, F7bsdProfile.MaximumCode);
                 throw new IOException(
-                    "CPU left the <=66 C zero-target band before reaching stop.");
+                    "CPU zero-target stop precondition was not sustained.");
             }
             stoppedSamples = telemetry.CpuFanRpm <= 150
                 ? stoppedSamples + 1
@@ -471,10 +472,8 @@ static void CpuZeroLoad()
         EnsureCpuBurnWorkers(burnTasks, burnCancellation.Token, 2);
         Stopwatch loadClock = Stopwatch.StartNew();
         double? firstAbove66Ms = null;
-        double? firstNonzeroTargetMs = null;
-        double? firstSpinningRpmMs = null;
-        int sustainedRestartSamples = 0;
-        bool completedSustainedRestart = false;
+        int sustainedHotZeroSamples = 0;
+        bool completedHotZero = false;
         for (int sample = 1; sample <= 180; sample++)
         {
             Thread.Sleep(TimeSpan.FromMilliseconds(500));
@@ -502,18 +501,9 @@ static void CpuZeroLoad()
             {
                 firstAbove66Ms ??= elapsedMs;
             }
-            if (state[3] > 0)
-            {
-                firstNonzeroTargetMs ??= elapsedMs;
-            }
-            if (telemetry.CpuFanRpm >= 300)
-            {
-                firstSpinningRpmMs ??= elapsedMs;
-            }
-            sustainedRestartSamples = state[3] >= 10 &&
-                telemetry.CpuFanRpm >= 800
-                    ? sustainedRestartSamples + 1
-                    : 0;
+            sustainedHotZeroSamples = state[0] >= 78 && state[3] == 0
+                ? sustainedHotZeroSamples + 1
+                : 0;
             Console.WriteLine(
                 $"load {sample}: {elapsedMs:F0} ms / workers {burnTasks.Count} / " +
                 $"raw {state[0]} C / effective {state[1]} C / target {state[3]} / " +
@@ -524,32 +514,24 @@ static void CpuZeroLoad()
                 backend.Set(F7bsdFan.Cpu, F7bsdProfile.MaximumCode);
                 throw new IOException("CPU reached the 85 C zero-load abort limit.");
             }
-            if (firstAbove66Ms.HasValue &&
-                !firstNonzeroTargetMs.HasValue &&
-                elapsedMs - firstAbove66Ms.Value > 3_000)
+            if (state[3] != 0)
             {
                 backend.Set(F7bsdFan.Cpu, F7bsdProfile.MaximumCode);
                 throw new IOException(
-                    "CPU target remained zero over three seconds above 66 C.");
+                    "CPU raw target changed before the 94 C critical takeover.");
             }
-            if (state[0] >= 75 && telemetry.CpuFanRpm < 300)
+            if (sustainedHotZeroSamples >= 4)
             {
-                backend.Set(F7bsdFan.Cpu, F7bsdProfile.MaximumCode);
-                throw new IOException("CPU fan had not restarted by 75 C.");
-            }
-            if (sustainedRestartSamples >= 4)
-            {
-                completedSustainedRestart = true;
+                completedHotZero = true;
                 break;
             }
         }
-        if (!firstAbove66Ms.HasValue || !firstNonzeroTargetMs.HasValue ||
-            !firstSpinningRpmMs.HasValue || !completedSustainedRestart)
+        if (!firstAbove66Ms.HasValue || !completedHotZero)
         {
             backend.Set(F7bsdFan.Cpu, F7bsdProfile.MaximumCode);
             throw new IOException(
-                "CPU zero-load test did not observe four consecutive sustainable " +
-                "thermal-tail restart samples.");
+                "CPU zero-load test did not observe four consecutive fixed-zero " +
+                "samples at or above 78 C.");
         }
 
         burnCancellation.Cancel();
@@ -578,13 +560,12 @@ static void CpuZeroLoad()
         }
         if (!running)
         {
-            throw new IOException("CPU fan did not remain restartable after tail load.");
+            throw new IOException("CPU fan did not restart after the raw zero-load test.");
         }
 
         Console.WriteLine(
             $"ZERO_LOAD_TIMING stop_set_ms={stopTransaction.Elapsed.TotalMilliseconds:F1} " +
-            $"above66_ms={firstAbove66Ms:F1} target_nonzero_ms={firstNonzeroTargetMs:F1} " +
-            $"fan_300rpm_ms={firstSpinningRpmMs:F1} " +
+            $"above66_ms={firstAbove66Ms:F1} hot_zero_samples={sustainedHotZeroSamples} " +
             $"restart_set_ms={restartTransaction.Elapsed.TotalMilliseconds:F1}");
     }
     finally
@@ -775,7 +756,7 @@ static void PluginCpu()
             control.Id.EndsWith(UM780XTXPlugin.CpuControlId, StringComparison.Ordinal));
         if (!cpu.Id.EndsWith(UM780XTXPlugin.CpuControlId, StringComparison.Ordinal))
         {
-            throw new InvalidOperationException("The staged CPU control ID is not v4.");
+            throw new InvalidOperationException("The staged CPU control ID is not raw-v1.");
         }
         float temperature = Value(container.TempSensors, "cpu-temperature");
         if (temperature >= 70)

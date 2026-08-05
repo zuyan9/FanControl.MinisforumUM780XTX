@@ -16,7 +16,7 @@ param(
     [string] $FanControlConfigDirectory,
 
     [string] $CpuControlId =
-        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4'
+        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-raw-v1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,7 +51,7 @@ if ($cpuCurve[0].SelectedTempSource.Identifier -notmatch
 $cpuCurve = $cpuCurve[0] | ConvertTo-Json -Depth 20 | ConvertFrom-Json
 $systemCurve = $systemCurve[0] | ConvertTo-Json -Depth 20 |
     ConvertFrom-Json
-$cpuCurve.Name = 'CPU Cool-Stop Curve v4'
+$cpuCurve.Name = 'CPU Raw Curve v1'
 $systemCurve.Name = 'System Raw Curve v2'
 $config.FanControl.FanCurves = @($cpuCurve, $systemCurve)
 

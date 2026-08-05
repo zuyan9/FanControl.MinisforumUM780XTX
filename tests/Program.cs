@@ -1,5 +1,4 @@
 using FanControl.Plugins;
-using System.Security.Cryptography;
 
 namespace FanControl.MinisforumUM780XTX.Tests;
 
@@ -34,11 +33,11 @@ internal static class Program
         (string Name, Action Body)[] tests =
         [
             ("linear percentage conversion", LinearPercentageConversion),
-            ("CPU thermal-envelope compiler exhaustive", CpuThermalEnvelopeCompilerExhaustive),
+            ("CPU flat-target compiler exhaustive", CpuFlatTargetCompilerExhaustive),
             ("CPU one-row firmware transitions exhaustive", CpuOneRowFirmwareTransitionsExhaustive),
-            ("CPU bytewise transitions exhaustive", CpuBytewiseTransitionsExhaustive),
+            ("CPU deterministic bytewise transitions exhaustive", CpuDeterministicTransitionsExhaustive),
             ("CPU exact B1 reset exhaustive", CpuExactB1ResetExhaustive),
-            ("CPU exact-prefix direct recovery", CpuExactPrefixDirectRecovery),
+            ("CPU exact-prefix deterministic recovery", CpuExactPrefixDeterministicRecovery),
             ("thin write allowlist", ThinWriteAllowlist),
             ("tach low-high-low decoder", TachLowHighLowDecoder),
             ("PawnIO parks every EC and PNP byte", PawnIoParksEveryByte),
@@ -68,7 +67,7 @@ internal static class Program
             ("persistent owned telemetry failure releases system", PersistentOwnedTelemetryFailureReleasesSystem),
             ("system guard gap releases to firmware", SystemGuardGapReleasesToFirmware),
             ("system drift faults without reengaging", SystemDriftFaultsWithoutReengaging),
-            ("CPU zero uses cool-stop thermal tail", CpuZeroUsesCoolStopThermalTail),
+            ("CPU zero stays flat below critical", CpuZeroStaysFlatBelowCritical),
             ("CPU mutations apply immediately", CpuMutationsApplyImmediately),
             ("CPU burst requests stay bounded", CpuBurstRequestsStayBounded),
             ("CPU writes ignore the system guard clock", CpuWritesIgnoreSystemGuardClock),
@@ -159,7 +158,7 @@ internal static class Program
             [new EcWrite(0x088b, 1)]));
     }
 
-    private static void CpuThermalEnvelopeCompilerExhaustive()
+    private static void CpuFlatTargetCompilerExhaustive()
     {
         byte[] exactB1 =
         {
@@ -173,32 +172,6 @@ internal static class Program
             new F7bsdCpuPolicyRow(51, 100, 93, 0),
             F7bsdCpuPolicy.GetB1Row(7));
 
-        (int Temperature, int Code)[] envelopeAnchors =
-        [
-            (0, 0), (66, 0),
-            (67, 10), (68, 10), (69, 10), (70, 10),
-            (71, 10), (72, 10), (73, 10), (74, 10),
-            (75, 13), (76, 15), (77, 18),
-            (78, 20), (79, 23), (80, 25), (81, 28), (82, 30),
-            (83, 32), (84, 34), (85, 35), (86, 37), (87, 39),
-            (88, 40), (89, 43), (90, 45), (91, 47), (92, 49),
-            (93, 51),
-        ];
-        foreach ((int temperature, int code) in envelopeAnchors)
-        {
-            Equal(code, F7bsdCpuPolicy.ThermalFloorCode(temperature));
-        }
-        int previousEnvelope = -1;
-        for (int temperature = 0;
-            temperature < F7bsdCpuPolicy.CriticalTemperatureC;
-            temperature++)
-        {
-            int floor = F7bsdCpuPolicy.ThermalFloorCode(temperature);
-            True(floor >= 0 && floor <= F7bsdProfile.MaximumCode);
-            True(floor >= previousEnvelope);
-            previousEnvelope = floor;
-        }
-
         F7bsdCpuRowState[][] targets = Enumerable
             .Range(0, F7bsdProfile.MaximumCode + 1)
             .Select(code => F7bsdCpuPolicy.CompileTarget((byte)code))
@@ -211,6 +184,7 @@ internal static class Program
                 states,
                 F7bsdCpuPolicy.FromMutableBytes(
                     F7bsdCpuPolicy.ToMutableBytes(states)));
+
             F7bsdCpuPolicyRow[] complete =
                 F7bsdCpuPolicy.CompileTargetRows(code);
             Equal(F7bsdCpuPolicy.TotalRowCount, complete.Length);
@@ -218,40 +192,26 @@ internal static class Program
             for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
             {
                 F7bsdCpuPolicyRow b1 = F7bsdCpuPolicy.GetB1Row(row);
+                Equal(new F7bsdCpuRowState(code, 0), states[row]);
+                Equal(code, complete[row].Base);
+                Equal((byte)0, complete[row].Slope);
                 Equal(b1.Upper, complete[row].Upper);
                 Equal(b1.Lower, complete[row].Lower);
-                Equal(states[row].Base, complete[row].Base);
-                Equal(states[row].Slope, complete[row].Slope);
-                True(F7bsdCpuPolicy.DominatesThermalEnvelopeAndRequest(
-                    row,
-                    states[row],
-                    code));
                 True(F7bsdCpuPolicy.IsTransitionBounded(row, states[row]));
             }
 
             foreach (bool cooling in new[] { false, true })
             {
-                int previousTemperatureTarget = -1;
                 for (int temperature = 0;
                     temperature < F7bsdCpuPolicy.CriticalTemperatureC;
                     temperature++)
                 {
-                    int target = F7bsdCpuPolicy.EvaluateTable(
-                        states,
-                        temperature,
-                        cooling);
-                    True(target >= code);
-                    True(target >= F7bsdCpuPolicy.ThermalFloorCode(temperature));
-                    True(target <= F7bsdProfile.MaximumCode);
-                    True(target >= previousTemperatureTarget);
-                    if (code > 0)
-                    {
-                        True(target >= F7bsdCpuPolicy.EvaluateTable(
-                            targets[code - 1],
+                    Equal(
+                        (int)code,
+                        F7bsdCpuPolicy.EvaluateTable(
+                            states,
                             temperature,
                             cooling));
-                    }
-                    previousTemperatureTarget = target;
                 }
                 Equal(
                     (int)F7bsdProfile.MaximumCode,
@@ -262,19 +222,6 @@ internal static class Program
             }
         }
 
-        for (int code = 0; code <= F7bsdProfile.MaximumCode; code++)
-        {
-            for (int row = 0; row <= 3; row++)
-            {
-                Equal(new F7bsdCpuRowState((byte)code, 0), targets[code][row]);
-            }
-            Equal(
-                code,
-                F7bsdCpuPolicy.EvaluateTable(
-                    targets[code],
-                    30,
-                    cooling: false));
-        }
         for (int first = 0; first <= F7bsdProfile.MaximumCode; first++)
         {
             for (int second = first + 1;
@@ -284,20 +231,8 @@ internal static class Program
                 False(targets[first].SequenceEqual(targets[second]));
             }
         }
-        Equal(new F7bsdCpuRowState(10, 50), targets[0][4]);
-        Equal(new F7bsdCpuRowState(19, 188), targets[0][5]);
-        Equal(new F7bsdCpuRowState(41, 200), targets[0][6]);
-        for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
-        {
-            Equal(
-                new F7bsdCpuRowState(F7bsdProfile.MaximumCode, 0),
-                targets[F7bsdProfile.MaximumCode][row]);
-        }
 
         Throws<ArgumentOutOfRangeException>(() => F7bsdCpuPolicy.CompileTarget(52));
-        Throws<ArgumentOutOfRangeException>(() =>
-            F7bsdCpuPolicy.ThermalFloorCode(
-                F7bsdCpuPolicy.CriticalTemperatureC));
         Throws<ArgumentException>(() => F7bsdCpuPolicy.FromMutableBytes([0, 1]));
     }
 
@@ -356,21 +291,22 @@ internal static class Program
             }
         }
 
-        // From the coolest row, a sudden 93 C sample remains at zero for three
-        // invocations, then reaches the sustainable restart row, high tail,
-        // and full target.
+        // Row selection still advances one band per invocation, but a flat
+        // table keeps the requested target unchanged throughout that process.
         F7bsdCpuRowState[] zero = F7bsdCpuPolicy.CompileTarget(0);
         int activeRow = 0;
-        int[] expectedTargets = [0, 0, 0, 23, 50, 51];
-        for (int invocation = 0; invocation < expectedTargets.Length; invocation++)
+        for (int invocation = 0;
+            invocation < F7bsdCpuPolicy.NormalRowCount;
+            invocation++)
         {
             (activeRow, int target) = FirmwarePolicyInvocation(
                 zero,
                 activeRow,
                 93,
                 cooling: false);
-            Equal(expectedTargets[invocation], target);
+            Equal(0, target);
         }
+        Equal(F7bsdCpuPolicy.NormalRowCount - 1, activeRow);
     }
 
     private static (int Row, int Target) FirmwarePolicyInvocation(
@@ -405,114 +341,113 @@ internal static class Program
 
     private static void AssertFirmwareTarget(byte code, int temperatureC, int target)
     {
-        True(target >= code);
-        True(target >= F7bsdCpuPolicy.ThermalFloorCode(temperatureC));
-        True(target <= F7bsdProfile.MaximumCode);
+        Equal(
+            temperatureC >= F7bsdCpuPolicy.CriticalTemperatureC
+                ? (int)F7bsdProfile.MaximumCode
+                : code,
+            target);
     }
 
-    private static void CpuBytewiseTransitionsExhaustive()
+    private static void CpuDeterministicTransitionsExhaustive()
     {
         F7bsdCpuRowState[][] targets = Enumerable
             .Range(0, F7bsdProfile.MaximumCode + 1)
             .Select(code => F7bsdCpuPolicy.CompileTarget((byte)code))
             .ToArray();
-        bool sawDirect = false;
-        bool sawB1Anchor = false;
-        HashSet<(int Row, F7bsdCpuRowState State)> verifiedDirectB1 = [];
-        using IncrementalHash pathHash =
-            IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        F7bsdCpuRowState[][] tables =
+            [F7bsdCpuPolicy.GetB1MutableStates(), .. targets];
 
-        for (int fromCode = 0;
-            fromCode <= F7bsdProfile.MaximumCode;
-            fromCode++)
+        foreach (F7bsdCpuRowState[] source in tables)
         {
-            F7bsdCpuRowState[] from = targets[fromCode];
-            for (int toCode = 0;
-                toCode <= F7bsdProfile.MaximumCode;
-                toCode++)
+            foreach (F7bsdCpuRowState[] destination in tables)
             {
-                F7bsdCpuRowState[] to = targets[toCode];
-                for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
-                {
-                    bool hasDirect = F7bsdCpuPolicy.TryPlanDirectRowTransition(
-                        row,
-                        from[row],
-                        to[row],
-                        out F7bsdCpuRowState[] direct,
-                        out int neighborChecks);
-                    True(neighborChecks <=
-                        F7bsdCpuPolicy.MaximumDirectPlannerNeighborChecks);
-                    F7bsdCpuRowState[] path = F7bsdCpuPolicy.PlanRowTransition(
-                        row,
-                        from[row],
-                        to[row]);
-                    pathHash.AppendData(
-                        [(byte)row, (byte)fromCode, (byte)toCode, (byte)path.Length]);
-                    foreach (F7bsdCpuRowState state in path)
-                    {
-                        pathHash.AppendData([state.Base, state.Slope]);
-                    }
+                F7bsdCpuTransitionStep[] plan =
+                    F7bsdCpuPolicy.PlanTransition(source, destination);
+                True(plan.Length <= F7bsdCpuPolicy.MaximumWritesPerTransition);
+                SequenceEqual(
+                    destination,
+                    F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                        source,
+                        plan,
+                        plan.Length));
 
-                    if (hasDirect)
+                int phase = 0;
+                for (int index = 0; index < plan.Length; index++)
+                {
+                    F7bsdCpuTransitionStep step = plan[index];
+                    if (CpuSlopeAddresses.Contains(step.Write.Address))
                     {
-                        sawDirect = true;
-                        True(direct.Length <=
-                            F7bsdCpuPolicy.DirectMaximumWritesPerRow);
-                        SequenceEqual(direct, path);
+                        if (step.Write.Value == 0)
+                        {
+                            Equal(0, phase);
+                        }
+                        else
+                        {
+                            phase = 2;
+                        }
                     }
                     else
                     {
-                        sawB1Anchor = true;
-                        True(path.Contains(F7bsdCpuPolicy.GetB1Row(row).State));
+                        True(CpuBaseAddresses.Contains(step.Write.Address));
+                        True(phase <= 1);
+                        phase = 1;
                     }
-                    True(path.Length <= F7bsdCpuPolicy.MaximumWritesPerRow);
 
-                    F7bsdCpuRowState previous = from[row];
-                    foreach (F7bsdCpuRowState state in path)
+                    F7bsdCpuRowState[] prefix =
+                        F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                            source,
+                            plan,
+                            index + 1);
+                    True(F7bsdCpuPolicy.TryMatchTransitionPrefix(
+                        source,
+                        plan,
+                        prefix,
+                        out int matched));
+                    Equal(index + 1, matched);
+                    for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
                     {
-                        Equal(1,
-                            (state.Base == previous.Base ? 0 : 1) +
-                            (state.Slope == previous.Slope ? 0 : 1));
-                        True(F7bsdCpuPolicy.IsTransitionBounded(row, state));
-                        if (verifiedDirectB1.Add((row, state)))
-                        {
-                            True(F7bsdCpuPolicy.TryPlanDirectRowTransition(
-                                row,
-                                state,
-                                F7bsdCpuPolicy.GetB1Row(row).State,
-                                out F7bsdCpuRowState[] directToB1));
-                            True(directToB1.Length <=
-                                F7bsdCpuPolicy.DirectMaximumWritesPerRow);
-                        }
-                        F7bsdCpuPolicyRow band = F7bsdCpuPolicy.GetB1Row(row);
-                        for (int temperature = band.Lower;
-                            temperature <= band.Upper;
-                            temperature++)
-                        {
-                            int target = F7bsdCpuPolicy.TargetAt(
-                                row,
-                                state,
-                                temperature);
-                            True(target >= F7bsdCpuPolicy.TransitionFloorAt(
-                                row,
-                                temperature));
-                            True(target <= F7bsdProfile.MaximumCode);
-                        }
-                        previous = state;
+                        True(F7bsdCpuPolicy.IsTransitionBounded(row, prefix[row]));
                     }
-                    Equal(to[row], previous);
                 }
             }
         }
-        True(sawDirect);
-        True(sawB1Anchor);
-        // Golden digest captured from the original exhaustive BFS after the
-        // cool-stop table was finalized. It pins every compiled-code pair's
-        // deterministic row path while the search-budget assertion above
-        // prevents the former repeated full-frontier scans from returning.
-        Equal(
-            "76BD815E710CAE8953A1D0AC45ECE992B8C26437FEC38E48B8C5583511FB892C",
-            Convert.ToHexString(pathHash.GetHashAndReset()));
+
+        F7bsdCpuTransitionStep[] adjacent = F7bsdCpuPolicy.PlanTransition(20, 21);
+        Equal(F7bsdCpuPolicy.NormalRowCount, adjacent.Length);
+        True(adjacent.All(step =>
+            CpuBaseAddresses.Contains(step.Write.Address) &&
+            step.Write.Value == 21));
+
+        F7bsdCpuRowState[] customSource = F7bsdCpuPolicy.CompileTarget(20);
+        F7bsdCpuRowState[] customDestination = F7bsdCpuPolicy.CompileTarget(20);
+        customSource[4] = new(10, 50);
+        customDestination[4] = new(20, 50);
+        F7bsdCpuTransitionStep[] threePhase = F7bsdCpuPolicy.PlanTransition(
+            customSource,
+            customDestination);
+        Equal(3, threePhase.Length);
+        SequenceEqual(
+            [
+                new EcWrite(F7bsdProfile.CpuSlopeAddresses[4], 0),
+                new EcWrite(F7bsdProfile.CpuBaseAddresses[4], 20),
+                new EcWrite(F7bsdProfile.CpuSlopeAddresses[4], 50),
+            ],
+            threePhase.Select(step => step.Write));
+        SequenceEqual(
+            customDestination,
+            F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                customSource,
+                threePhase,
+                threePhase.Length));
+
+        F7bsdCpuRowState[] unsafeTable = F7bsdCpuPolicy.CompileTarget(20);
+        unsafeTable[6] = new(51, 255);
+        Throws<ArgumentException>(() => F7bsdCpuPolicy.PlanTransition(
+            unsafeTable,
+            F7bsdCpuPolicy.CompileTarget(21)));
+        Throws<ArgumentException>(() => F7bsdCpuPolicy.PlanTransition(
+            F7bsdCpuPolicy.CompileTarget(20),
+            unsafeTable));
     }
 
     private static void CpuExactB1ResetExhaustive()
@@ -521,16 +456,6 @@ internal static class Program
         for (byte code = 0; code <= F7bsdProfile.MaximumCode; code++)
         {
             F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(code);
-            for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
-            {
-                True(F7bsdCpuPolicy.TryPlanDirectRowTransition(
-                    row,
-                    target[row],
-                    F7bsdCpuPolicy.GetB1Row(row).State,
-                    out F7bsdCpuRowState[] directToB1));
-                True(directToB1.Length <=
-                    F7bsdCpuPolicy.DirectMaximumWritesPerRow);
-            }
             F7bsdCpuTransitionStep[] engage = F7bsdCpuPolicy.PlanTransition(b1, target);
             True(engage.Length <= F7bsdCpuPolicy.MaximumWritesPerTransition);
             SequenceEqual(target, ApplyCpuTransitionSteps(b1, engage));
@@ -544,7 +469,7 @@ internal static class Program
         }
     }
 
-    private static void CpuExactPrefixDirectRecovery()
+    private static void CpuExactPrefixDeterministicRecovery()
     {
         (F7bsdCpuRowState[] Source, F7bsdCpuRowState[] Destination)[] cases =
         [
@@ -583,7 +508,7 @@ internal static class Program
                     F7bsdCpuPolicy.MaximumWritesPerTransition);
                 SequenceEqual(b1, ApplyCpuTransitionSteps(observed, recovery));
 
-                // A direct B1 recovery becomes the next issued transaction.
+                // The deterministic B1 recovery becomes the next issued transaction.
                 // If interrupted, its exact remaining suffix must still finish.
                 for (int recovered = 0; recovered <= recovery.Length; recovered++)
                 {
@@ -1584,7 +1509,7 @@ internal static class Program
         driftBackend.Dispose();
     }
 
-    private static void CpuZeroUsesCoolStopThermalTail()
+    private static void CpuZeroStaysFlatBelowCritical()
     {
         FakeTransport transport = new();
         byte[] b1 = transport.CpuBytes();
@@ -1596,36 +1521,26 @@ internal static class Program
         AssertCpuPolicy(transport, 0);
         False(transport.CpuBytes().SequenceEqual(b1));
 
-        F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(0);
-        (int Temperature, int Heating, int Cooling)[] targets =
-        [
-            (30, 0, 0),
-            (65, 0, 0),
-            (66, 0, 10),
-            (67, 10, 10),
-            (73, 13, 13),
-            (74, 14, 14),
-            (76, 15, 19),
-            (77, 20, 20),
-            (82, 30, 30),
-            (88, 41, 41),
-            (93, 51, 51),
-            (94, 51, 51),
-        ];
-        foreach ((int temperature, int heating, int cooling) in targets)
+        F7bsdCpuRowState[] zero = F7bsdCpuPolicy.CompileTarget(0);
+        F7bsdCpuRowState[] ten = F7bsdCpuPolicy.CompileTarget(10);
+        for (int temperature = 0;
+            temperature < F7bsdCpuPolicy.CriticalTemperatureC;
+            temperature++)
         {
-            Equal(
-                heating,
-                F7bsdCpuPolicy.EvaluateTable(target, temperature, cooling: false));
-            Equal(
-                cooling,
-                F7bsdCpuPolicy.EvaluateTable(target, temperature, cooling: true));
+            foreach (bool cooling in new[] { false, true })
+            {
+                Equal(0, F7bsdCpuPolicy.EvaluateTable(zero, temperature, cooling));
+                Equal(10, F7bsdCpuPolicy.EvaluateTable(ten, temperature, cooling));
+            }
         }
-        True(F7bsdCpuPolicy.EvaluateTable(target, 30, cooling: false) <
-            F7bsdCpuPolicy.EvaluateTable(
-                F7bsdCpuPolicy.GetB1MutableStates(),
-                30,
-                cooling: false));
+        Equal(51, F7bsdCpuPolicy.EvaluateTable(
+            zero,
+            F7bsdCpuPolicy.CriticalTemperatureC,
+            cooling: false));
+        Equal(51, F7bsdCpuPolicy.EvaluateTable(
+            ten,
+            F7bsdCpuPolicy.CriticalTemperatureC,
+            cooling: true));
         backend.Dispose();
         SequenceEqual(b1, transport.CpuBytes());
     }
@@ -1832,7 +1747,7 @@ internal static class Program
             IPluginControlSensor2 system = FindControl(
                 container.ControlSensors,
                 UM780XTXPlugin.SystemControlId);
-            Equal("UM780 XTX CPU Fan Target (Cool-Stop Thermal Tail)", cpu.Name);
+            Equal("UM780 XTX CPU Fan Raw Target", cpu.Name);
             Equal("UM780 XTX System Fan Raw Target", system.Name);
             Equal(
                 $"{plugin.Name}/minisforum.um780xtx.f7bsd.fan1",

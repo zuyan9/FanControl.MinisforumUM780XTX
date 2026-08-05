@@ -6,7 +6,7 @@ namespace FanControl.MinisforumUM780XTX;
 public sealed class UM780XTXPlugin : IPlugin2
 {
     internal const string CpuControlId =
-        "minisforum.um780xtx.f7bsd.cpu-cool-stop-v4";
+        "minisforum.um780xtx.f7bsd.cpu-raw-v1";
     internal const string SystemControlId =
         "minisforum.um780xtx.f7bsd.system-raw-v2";
 
@@ -51,7 +51,7 @@ public sealed class UM780XTXPlugin : IPlugin2
         this.logger = logger;
         cpuControl = new ControlSensor(
             CpuControlId,
-            "UM780 XTX CPU Fan Target (Cool-Stop Thermal Tail)",
+            "UM780 XTX CPU Fan Raw Target",
             $"{Name}/{cpuFan.Id}",
             value => Set(F7bsdFan.Cpu, value),
             () => Reset(F7bsdFan.Cpu),
@@ -113,7 +113,7 @@ public sealed class UM780XTXPlugin : IPlugin2
             container.TempSensors.AddRange([cpuTemperature, systemTemperature]);
             container.ControlSensors.AddRange([cpuControl, systemControl]);
             Log(
-                "Minisforum UM780 XTX loaded cool-stop CPU-target and guarded " +
+                "Minisforum UM780 XTX loaded raw CPU-target and guarded " +
                 "raw system-fan controls.");
         }
     }

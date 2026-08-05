@@ -21,7 +21,7 @@ param(
     [string] $FanControlConfigDirectory,
 
     [string] $CpuControlId =
-        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-cool-stop-v4'
+        'Minisforum UM780 XTX (F7BSD)/minisforum.um780xtx.f7bsd.cpu-raw-v1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +48,11 @@ function Set-Control {
     $Control.Enable = $null -ne $Code
     $Control.ManualControl = $true
     $Control.SelectedFanCurve = $null
+    $Control.MinimumPercent = 0
+    $Control.SelectedStart = 0
+    $Control.SelectedStop = 0
+    $Control.SelectedCommandStepUp = 100
+    $Control.SelectedCommandStepDown = 100
     $Control.ForceApply = $false
     if ($null -ne $Code) {
         $Control.ManualControlValue = [int][Math]::Round(

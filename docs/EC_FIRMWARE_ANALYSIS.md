@@ -123,27 +123,31 @@ boundary. The row moves by at most one on each invocation. The arithmetic at
 and addition of the selected base. This matches the plugin's policy model
 exactly; there is no signed-slope interpretation or lookup-table transform.
 
-The one-row limit matters for discontinuous temperatures. With the v4 code-zero
-table and a stale coolest-row state, a sudden 93 C sample produces normal-row
-targets `0,0,0,23,50,51` over six selector invocations; a realistic 54..66 C
-idle-row state produces `23,50,51`. The row-4 value now comes from the
-hardware-qualified code-10 restart floor beginning at 67 C. Conversely, a
-large discontinuous cooling event can leave the row several bands above the
-current temperature and exercise
-unsigned out-of-band subtraction until later invocations step it down. Adjacent
-heating/cooling crossings are compiler-tested. Reset and recovery ignore only
-that firmware-owned target output while continuing to require plausible
-temperatures, override zero, the exact immutable B1 profile, and an exact
-issued-table certificate, so the transient cannot strand a modified table on
-orderly exit. Resume timing still requires separate live qualification.
+The one-row limit does not make the raw CPU target temperature-dependent. Raw
+control sets every normal-row base to the requested code and every normal-row
+slope to zero, so moving between rows leaves the target unchanged at every
+temperature below the independent critical takeover. A normal-table update
+zeros a row's slope before changing its base; restoration then returns the base
+and slope to exact B1. Each issued one-byte prefix therefore remains a bounded
+fan target even if the firmware selects that row during the transaction.
+
+Once exact B1 has been restored, a large discontinuous cooling event can still
+leave the firmware's row several bands above the current temperature and
+exercise the stock table's unsigned out-of-band subtraction until later
+invocations step it down. Reset and recovery ignore only that firmware-owned
+target output while continuing to require plausible temperatures, override
+zero, the exact immutable B1 profile, and an exact issued-table certificate, so
+the transient cannot strand a modified table on orderly exit. Resume timing
+still requires separate live qualification.
 
 Most importantly for byte-wise updates, this routine directly indexes the
 current row and, when transitioning, the adjacent/final row. It does not scan,
 checksum, copy, or validate the complete table. Normal base and slope values
 feed bounded arithmetic; they are not used as loop counts or pointers.
-Consequently, the plugin's compiler-validated intermediate rows can change the
-requested target, but the inspected fan-policy code provides no path for those
-values to create an EC infinite loop or table-latch deadlock.
+Consequently, the plugin's deterministic one-byte intermediate rows can change
+the selected target briefly during a transaction, but the inspected fan-policy
+code provides no path for those values to create an EC infinite loop or
+table-latch deadlock.
 
 The independent critical comparison is at `0x9d23..0x9d37`. At an effective
 temperature of 94 C or higher it overwrites the normal result with critical-row
@@ -196,15 +200,16 @@ takes a separate path at `0x9ee9..0x9eed` that writes `0x1803 = 0` directly on
 the next serviced feedback slot. Physical fan coast-down, tach reporting, and
 Fan Control display polling can remain slower than that DCR write.
 
-The v4 live campaign matches those distinctions. A cold B1-to-target request
+The earlier v4 live campaign matches those distinctions. A cold B1-to-target request
 completed in 49.8 ms, subsequent adjacent requests took about 14..21 ms, and
 515 synchronous Set calls (510 distinct EC table mutations) had 13.6 ms mean /
 15.6 ms p95 / 45.8 ms maximum call latency. From a physical stop under CPU
 load, the target
 changed from 0 to the row-4 code-10 floor at 67 C; tach reported a running fan
 about one second later and remained above 800 RPM for four consecutive
-half-second samples. These are observations on this machine, not firmware
-deadlines.
+half-second samples. The raw policy deliberately removes that temperature
+promotion: all seven normal rows retain the requested code. These are
+observations on this machine, not firmware deadlines.
 
 There is no unconditional elapsed-time upper bound. The scheduler gate at
 `0x9b4f` suppresses advancement in EC states `0x30` and `0x50`; the feedback
@@ -299,7 +304,7 @@ The defensible conclusion is therefore two-part: CPU policy-table semantics are
 now understood well enough to rule out the specific firmware-code deadlock
 mechanisms above; generic raw indexed-port transport and user-mode system-fan
 ownership remain residual platform risks and require staged, attended testing.
-The v4 staged campaign completed high-rate direct access, repeated dual-control
+The previous v4 staged campaign completed high-rate direct access, repeated dual-control
 handoffs, real Fan Control curve/load operation, orderly exit, and relaunch
 without a freeze, plugin fault, relevant Windows event, or new dump. That
 evidence reduces—but cannot eliminate—the remaining transport/platform risk.

@@ -7,8 +7,8 @@ machine's IT5571 embedded controller (EC), and exposes:
 
 - CPU and system fan RPM;
 - CPU and system raw EC temperatures;
-- a native CPU cool-stop target compiled into the EC's B1 temperature bands
-  with an autonomous thermal tail; and
+- a native fixed CPU-fan target using the EC's stock closed-loop RPM control;
+  and
 - a guarded raw system-fan target control.
 
 The plugin does not scan EC memory or attempt generic Minisforum support.
@@ -39,43 +39,42 @@ Fan Control percentages map linearly to native EC codes `0..51`. Code `n` is a
 nominal `n * 100 RPM` value, but the two controls intentionally have different
 semantics.
 
-### CPU Fan Target (Cool-Stop Thermal Tail)
+### CPU Fan Raw Target
 
-ID: `minisforum.um780xtx.f7bsd.cpu-cool-stop-v4`
+ID: `minisforum.um780xtx.f7bsd.cpu-raw-v1`
 
-This is a native low-temperature request with an EC-resident thermal envelope,
-not a flat RPM command and not an OEM B1 floor. Fan Control requests code
-`0..51`; the plugin compiles that request into the seven mutable base/slope
-fields of the immutable B1 temperature bands. Every code is a distinct physical
-policy. Code `0` is a genuine zero target on the heating path through 66 C;
-on the cooling path the row hysteresis retains code `10` at 66 C and returns to
-zero below it. Repeated live tests reached a physical 0 RPM and restarted
-reliably. On heating, the autonomous envelope requests the proven sustainable code 10
-beginning at 67 C, rises to approximately 1500 RPM at 76 C, then reaches 3000
-RPM at 82 C, 4000 RPM at 88 C, and 5100 RPM at 93 C. A higher Fan Control
-request raises that subcritical minimum. Because this v4 policy follows the
-requested target plus that thermal envelope, it may be below the OEM B1 target
-at some temperatures. Explicit raw codes `1..9` remain available, but this fan
-can hunt or stall at those targets; a practical stop/start curve should jump
-from code `0` to about code `10`.
+Fan Control requests native code `0..51`. The plugin writes that code as the
+base of all seven normal B1 temperature rows and sets all seven normal slopes to
+zero. The EC therefore retains one fixed closed-loop target at every
+subcritical temperature; the plugin does not add a temperature floor or hidden
+curve. Code `0` is a genuine stop request. Codes `1..9` are also exposed
+unchanged, although the physical fan can stall or hunt below its sustainable
+running speed. Fan Control owns curves, hysteresis, mixing, minimum-running
+speed, start/stop behavior, and command cadence.
 
 The independent B1 critical row `(51,100,93,0)` is never written and takes over
-at 94 C and above. Every normal-row transition is planned byte by byte so each
-issued prefix satisfies the conservative transition floor. The plugin verifies
-the selector, immutable temperature bands, critical row, temperature override,
-expected mutable table, and write readback in the same guarded transaction.
+at 94 C and above. That firmware takeover is the only temperature-based CPU
+override retained by the plugin. Preventing it would require writing the
+critical row and is intentionally unsupported.
 
-The firmware changes at most one temperature row per policy invocation. From a
-stale coolest-row state, an abrupt 93 C sample therefore produces targets
-`0,0,0,23,50,51` over six invocations; from the realistic 54..66 C idle row it
-produces `23,50,51`. The normal 0-RPM-to-load path has been qualified on this
-machine, but an instantaneous 93 C jump and sleep/resume remain separate cases.
+Every normal-table update is a short deterministic sequence: zero a differing
+slope, write the requested base, then write a nonzero destination slope only
+when restoring exact B1. The plugin verifies the selector, immutable
+temperature bands, critical row, temperature override, expected mutable table,
+and final readback in the same guarded transaction. It never writes the
+firmware-owned live target byte.
 
 Every distinct CPU request is applied synchronously and reported only after the
 guarded table transaction completes. Exact duplicate requests return without EC
 I/O. There is no plugin-side rate limiter or deferred write on the telemetry
 path; Fan Control owns output cadence, command stepping, curves, hysteresis,
 mixing, and start/stop policy.
+
+Duplicate suppression deliberately trusts the plugin's exclusive-ownership
+session instead of rereading the fourteen mutable bytes on every Fan Control
+tick. Do not use another EC writer concurrently. After sleep/resume or any
+suspected firmware reinitialization, refresh the plugin before trusting an
+unchanged displayed request; sleep/resume remains unqualified.
 
 For a synchronous partial-write failure, recovery accepts only exact prefixes
 of the transition the plugin actually issued, then restores the exact B1
@@ -140,9 +139,10 @@ cooperative. Software that ignores it can still race this plugin.
 Do not run another EC fan-control utility at the same time. Start with an
 attended, known-running system-fan target before experimenting with lower codes.
 
-The CPU `v4` ID intentionally prevents configurations made for the earlier v2
-minimum or v3 1000-RPM-floor contracts from binding silently. The unchanged
-system raw contract retains its `system-raw-v2` ID.
+The `cpu-raw-v1` ID intentionally prevents curves made for the earlier
+temperature-dependent CPU contracts from binding silently. Re-select the new
+CPU control after upgrading. The unchanged system contract retains its
+`system-raw-v2` ID.
 
 A control transaction failure latches that individual Fan Control sensor until
 plugin refresh, preventing one rejected curve output from becoming repeated EC
@@ -158,22 +158,32 @@ is consistent with a GPU/display timeout but does not identify the initiating
 cause. The available evidence neither proved that the plugin caused the freezes
 nor excluded raw EC traffic provoking an EC/firmware deadlock.
 
-Version 4.0.0 has passed direct stop/restart, autonomous zero-to-load recovery,
-high-rate CPU transaction, real Fan Control dual-control, real curve, and
-all-core-load stages on this exact machine. No freeze, black screen, plugin
-fault, relevant Windows event, or new live-kernel dump occurred. These tests
-reduce uncertainty; they do not prove that generic user-mode EC traffic can
-never deadlock firmware or that an unrelated GPU/platform fault cannot recur.
-Save work and test attended. Live system code `0`, an actual 70 C system-fan
-trip, forced termination, OS crash, sleep/resume, multi-hour operation, and an
-instantaneous jump into the high-temperature CPU tail remain untested.
+The previous temperature-dependent build passed direct stop/restart, high-rate
+CPU transaction, real Fan Control dual-control, curve, CPU-load, and repeated
+iGPU-load stages on this exact machine. A separate Cinebench failure produced a
+Windows `0x141` AMD display-engine timeout; later repeated runs completed both
+with Fan Control off and with more aggressive cooling. These results reduce
+uncertainty but do not prove that generic user-mode EC traffic can never
+deadlock firmware or that an unrelated GPU/platform fault cannot recur. Save
+work and test experimental builds attended.
 
-The stabilized table model covers normal heating/cooling and exact adjacent-row
-crossings. A large discontinuous cooling event while the firmware row remains
-several bands high can exercise unsigned out-of-band subtraction until the EC
-steps back through those rows. Reset/Close can now restore exact B1 during that
-firmware-owned target transient, but sleep/resume behavior itself still needs
-live qualification.
+With raw control active, every normal row has the same base and zero slope, so
+heating, cooling, and row hysteresis cannot alter the requested subcritical
+target. After exact B1 restoration, stock firmware row behavior resumes.
+Reset/Close can restore exact B1 during a firmware-owned target transient, but
+sleep/resume and abnormal termination still need separate qualification.
+
+During preliminary `cpu-raw-v1` qualification at native code `10`, a Cinebench
+GPU run reproduced the same AMD `0x141` display-engine timeout seen in the
+earlier incidents. An AMD xHCI `0x144` host-controller error followed about
+three seconds later and the machine reset. CPU package temperature peaked at
+86.4 C, the requested CPU target and fresh EC telemetry remained valid, and a
+post-reboot read-only audit found exact stock fan state. The recurring GPU
+failure signature spans multiple boots and at least two AMD driver images, so
+it does not specifically implicate this build; it also means this build has not
+yet passed a long GPU soak. Further testing should use controlled plugin-off,
+telemetry-only, and raw-target comparisons rather than an unattended low-fan
+campaign.
 
 The extracted BIOS 1.06 EC image and the firmware routines behind both controls
 are documented in [UM780 XTX EC firmware analysis](docs/EC_FIRMWARE_ANALYSIS.md).
@@ -204,7 +214,7 @@ release:
 ```powershell
 dotnet build -c Release `
   "-p:FanControlDir=C:\path\to\FanControl_272_net_10_0" `
-  -p:Version=4.1.0
+  -p:Version=0.2.0
 ```
 
 ### GitHub Actions releases
@@ -226,13 +236,14 @@ and attaches the one-DLL ZIP. An existing tag is rejected. The equivalent
 GitHub CLI command is:
 
 ```powershell
-gh workflow run build.yml --ref master -f version=4.1.0
+gh workflow run build.yml --ref master -f version=0.2.0
 ```
 
-The offline suite checks every v4 CPU request over both thermal paths, one-row
-firmware heating transients, all `52 x 52 x 7` compiled-policy transitions,
+The offline suite checks every raw CPU request over both thermal paths, one-row
+firmware transitions, all flat-target/B1 table transitions and their exact
+prefixes,
 immediate distinct requests, zero-I/O duplicate requests, interruption of both
-the original write and its direct exact-prefix recovery, non-prefix rejection,
+the original write and its deterministic exact-prefix recovery, non-prefix rejection,
 exact B1 reset, EC address
 allowlists, parking and poisoning behavior, bounded system ownership/release,
 cross-fan fault isolation, thermal and timing boundaries, drift, cleanup retry,
@@ -240,7 +251,10 @@ telemetry ordering, and plugin exception containment.
 
 ## Hardware validation status
 
-The exact v4.0.0 DLL was tested directly and inside Fan Control V272 on the
+The completed campaigns below exercised the predecessor v4 cool-stop policy,
+not the current `cpu-raw-v1` table. They remain relevant to the shared
+transport, transaction, restoration, and Fan Control integration paths. The
+exact prior v4.0.0 DLL was tested directly and inside Fan Control V272 on the
 machine above. Direct validation completed 515 synchronous CPU Set calls (510
 distinct EC table mutations) in 7.7 seconds; latency across the calls was 13.6
 ms mean, 15.6 ms p95, and 45.8 ms maximum. The cold first request completed in
@@ -304,8 +318,9 @@ A future, separately reviewed and properly signed F7BSD-specific PawnIO module
 could collapse a complete parked EC transaction into one driver call and make a
 best-effort sentinel release when its client handle closes. The installed
 PawnIO loader does not accept an ad-hoc unsigned board module, so that work also
-requires a trusted signing and distribution path and is not part of v4. Such a
-module could narrow user-mode death and transaction-race windows; it would not
-provide exclusive ownership against software that ignores the ISA mutex or
+requires a trusted signing and distribution path and is not part of this
+plugin. Such a module could narrow user-mode death and transaction-race
+windows; it would not provide exclusive ownership against software that ignores
+the ISA mutex or
 guarantee cleanup while the kernel, EC firmware, or hardware itself is frozen
 or power is lost.
