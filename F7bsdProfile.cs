@@ -49,19 +49,13 @@ internal static class F7bsdProfile
     internal static readonly ushort[] CpuOwnedAddresses =
         [.. CpuBaseAddresses, .. CpuSlopeAddresses];
 
-    private static readonly ushort[] CpuBandAddresses = CpuBaseAddresses
-        .SelectMany(address => new[] { (ushort)(address + 1), (ushort)(address + 2) })
-        .ToArray();
     private static readonly ushort[] CpuCriticalAddresses =
         [0x0325, 0x0326, 0x0327, 0x08b7];
-    private static readonly ushort CpuProfileSelectorAddress = 0x032f;
     private static readonly ushort CpuTemperatureOverrideAddress = 0x088a;
 
     internal static readonly ushort[] CpuSnapshotAddresses =
     [
-        CpuProfileSelectorAddress,
         CpuTemperatureOverrideAddress,
-        .. CpuBandAddresses,
         .. CpuCriticalAddresses,
         .. CpuOwnedAddresses,
     ];
@@ -74,22 +68,7 @@ internal static class F7bsdProfile
     internal static readonly ushort[] SystemEffectiveTemperaturePollAddresses =
         [SystemEffectiveTemperatureAddress];
 
-    private static readonly byte[] ExpectedCpuBands =
-    [
-        25, 0,
-        45, 25,
-        54, 45,
-        66, 54,
-        76, 66,
-        88, 76,
-        93, 88,
-    ];
     private static readonly byte[] ExpectedCpuCriticalRow = [51, 100, 93, 0];
-    private static readonly byte[] ExpectedCpuBaseline =
-    [
-        0, 16, 18, 21, 28, 32, 33,
-        0, 10, 33, 58, 60, 16, 200,
-    ];
     private static readonly HashSet<ushort> ReadAllowlist =
     [
         .. ControllerProfileAddresses,
@@ -99,11 +78,10 @@ internal static class F7bsdProfile
         .. CpuSnapshotAddresses,
         .. SystemStateAddresses,
     ];
-    private static readonly Dictionary<ushort, byte> CpuRestoreSlopes =
-        CpuSlopeAddresses.Select((address, index) =>
-                new KeyValuePair<ushort, byte>(address, ExpectedCpuBaseline[7 + index]))
-            .ToDictionary();
     private static readonly HashSet<ushort> CpuBases = [.. CpuBaseAddresses];
+    private static readonly Dictionary<ushort, int> CpuSlopes = CpuSlopeAddresses
+        .Select((address, index) => new KeyValuePair<ushort, int>(address, index))
+        .ToDictionary();
 
     internal static byte ToCode(float percentage)
     {
@@ -132,24 +110,12 @@ internal static class F7bsdProfile
             throw new ArgumentException("Unexpected CPU snapshot length.", nameof(snapshot));
         }
 
-        int bandsOffset = 2;
-        int criticalOffset = bandsOffset + ExpectedCpuBands.Length;
+        int criticalOffset = 1;
         int baselineOffset = criticalOffset + ExpectedCpuCriticalRow.Length;
-        if (snapshot[0] != 0xb1)
-        {
-            throw new PlatformNotSupportedException(
-                $"CPU profile 0x{snapshot[0]:X2} is not the supported B1 profile.");
-        }
-        if (snapshot[1] != 0)
+        if (snapshot[0] != 0)
         {
             throw new PlatformNotSupportedException(
                 "The CPU firmware-temperature override is active.");
-        }
-        if (!snapshot.Slice(bandsOffset, ExpectedCpuBands.Length)
-            .SequenceEqual(ExpectedCpuBands))
-        {
-            throw new PlatformNotSupportedException(
-                "The CPU temperature bands do not match the B1 profile.");
         }
         if (!snapshot.Slice(criticalOffset, ExpectedCpuCriticalRow.Length)
             .SequenceEqual(ExpectedCpuCriticalRow))
@@ -159,12 +125,7 @@ internal static class F7bsdProfile
         }
 
         ReadOnlySpan<byte> baseline = snapshot[baselineOffset..];
-        if (!baseline.SequenceEqual(ExpectedCpuBaseline))
-        {
-            throw new PlatformNotSupportedException(
-                "The CPU table is not the exact B1 baseline. Restart Windows before " +
-                "loading the plugin after an uncontrolled termination.");
-        }
+        ValidateCapturedCpuBaseline(baseline);
         return baseline.ToArray();
     }
 
@@ -222,12 +183,7 @@ internal static class F7bsdProfile
 
     internal static EcWrite[] CpuRestoreWrites(ReadOnlySpan<byte> baseline)
     {
-        if (baseline.Length != CpuOwnedAddresses.Length ||
-            !baseline.SequenceEqual(ExpectedCpuBaseline))
-        {
-            throw new ArgumentException("CPU restoration requires the captured B1 table.",
-                nameof(baseline));
-        }
+        ValidateCapturedCpuBaseline(baseline);
 
         byte[] captured = baseline.ToArray();
         return CpuSlopeAddresses.Select(address => new EcWrite(address, 0))
@@ -255,9 +211,6 @@ internal static class F7bsdProfile
         foreach (EcWrite write in writes)
         {
             bool allowed =
-                (CpuBases.Contains(write.Address) && write.Value <= MaximumCode) ||
-                (CpuRestoreSlopes.TryGetValue(write.Address, out byte restoreSlope) &&
-                    (write.Value == 0 || write.Value == restoreSlope)) ||
                 (write.Address == SystemTargetAddress && write.Value <= MaximumCode) ||
                 (write.Address == SystemTemperatureOverrideAddress &&
                     write.Value is 0 or SystemSentinel);
@@ -269,11 +222,47 @@ internal static class F7bsdProfile
         }
     }
 
+    internal static void AssertCpuWritesAllowed(
+        IEnumerable<EcWrite> writes,
+        ReadOnlySpan<byte> baseline)
+    {
+        ValidateCapturedCpuBaseline(baseline);
+        foreach (EcWrite write in writes)
+        {
+            bool allowed =
+                (CpuBases.Contains(write.Address) && write.Value <= MaximumCode) ||
+                (CpuSlopes.TryGetValue(write.Address, out int index) &&
+                    (write.Value == 0 ||
+                        write.Value == baseline[CpuBaseAddresses.Length + index]));
+            if (!allowed)
+            {
+                throw new InvalidOperationException(
+                    $"EC CPU write 0x{write.Address:X4}=0x{write.Value:X2} is not allowed.");
+            }
+        }
+    }
+
     private static void AssertCode(byte code, string parameterName)
     {
         if (code > MaximumCode)
         {
             throw new ArgumentOutOfRangeException(parameterName);
+        }
+    }
+
+    private static void ValidateCapturedCpuBaseline(ReadOnlySpan<byte> baseline)
+    {
+        if (baseline.Length != CpuOwnedAddresses.Length)
+        {
+            throw new ArgumentException("Unexpected CPU baseline length.", nameof(baseline));
+        }
+        foreach (byte baseCode in baseline[..CpuBaseAddresses.Length])
+        {
+            if (baseCode > MaximumCode)
+            {
+                throw new PlatformNotSupportedException(
+                    "A captured CPU base target is outside code 0..51.");
+            }
         }
     }
 

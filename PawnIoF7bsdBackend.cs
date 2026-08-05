@@ -171,9 +171,11 @@ internal sealed class PawnIoF7bsdBackend : IDisposable
 
         try
         {
-            active.WriteVerified(F7bsdProfile.CpuTargetWrites(
-                requestedCode,
-                includeSlopes: !cpuCode.HasValue));
+            active.WriteCpuVerified(
+                F7bsdProfile.CpuTargetWrites(
+                    requestedCode,
+                    includeSlopes: !cpuCode.HasValue),
+                ActiveCpuBaseline());
             cpuCode = requestedCode;
             return requestedCode;
         }
@@ -187,7 +189,7 @@ internal sealed class PawnIoF7bsdBackend : IDisposable
             {
                 cpuRestorePending = true;
                 throw new AggregateException(
-                    "CPU control failed and B1 restoration is incomplete.",
+                    "CPU control failed and captured-state restoration is incomplete.",
                     failure,
                     cleanup);
             }
@@ -214,7 +216,8 @@ internal sealed class PawnIoF7bsdBackend : IDisposable
 
     private void RestoreCpuCore(PawnIoTransport active)
     {
-        active.WriteVerified(F7bsdProfile.CpuRestoreWrites(ActiveCpuBaseline()));
+        byte[] baseline = ActiveCpuBaseline();
+        active.WriteCpuVerified(F7bsdProfile.CpuRestoreWrites(baseline), baseline);
         cpuCode = null;
         cpuRestorePending = false;
     }
