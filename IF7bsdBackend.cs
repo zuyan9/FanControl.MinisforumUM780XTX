@@ -10,4 +10,3 @@ internal interface IF7bsdBackend : IDisposable
 
     void Reset(F7bsdFan fan);
 }
-

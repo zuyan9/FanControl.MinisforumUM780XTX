@@ -4,7 +4,9 @@ internal sealed record F7bsdTelemetry(
     int CpuFanRpm,
     int SystemFanRpm,
     int CpuTemperatureC,
-    int SystemTemperatureC);
+    int SystemTemperatureC,
+    byte? SystemAppliedCode = null,
+    byte? CpuAppliedCode = null);
 
 internal static class F7bsdTelemetryDecoder
 {
@@ -17,19 +19,39 @@ internal static class F7bsdTelemetryDecoder
                 nameof(values));
         }
 
-        if (values[0] != values[2] || values[3] != values[5])
+        if (!TryDecodeCounter(values[..3], out int cpuRpm) ||
+            !TryDecodeCounter(values[3..6], out int systemRpm))
         {
             telemetry = null;
             return false;
         }
 
-        ushort cpuCounter = (ushort)(values[0] | (values[1] << 8));
-        ushort systemCounter = (ushort)(values[3] | (values[4] << 8));
         telemetry = new F7bsdTelemetry(
-            CounterToRpm(cpuCounter),
-            CounterToRpm(systemCounter),
+            cpuRpm,
+            systemRpm,
             values[6],
             values[7]);
+        return true;
+    }
+
+    internal static bool TryDecodeCounter(
+        ReadOnlySpan<byte> lowHighLow,
+        out int rpm)
+    {
+        if (lowHighLow.Length != 3)
+        {
+            throw new ArgumentException(
+                "A tachometer sample must contain low/high/low bytes.",
+                nameof(lowHighLow));
+        }
+        if (lowHighLow[0] != lowHighLow[2])
+        {
+            rpm = 0;
+            return false;
+        }
+
+        ushort counter = (ushort)(lowHighLow[0] | (lowHighLow[1] << 8));
+        rpm = CounterToRpm(counter);
         return true;
     }
 

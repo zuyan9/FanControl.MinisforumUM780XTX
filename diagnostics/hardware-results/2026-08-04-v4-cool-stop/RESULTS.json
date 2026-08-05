@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-08-04",
+  "machine": {
+    "model": "Minisforum UM780 XTX",
+    "board": "F7BSD 1.1",
+    "bios": "1.06",
+    "ec": "0.8",
+    "os": "Windows 11 x64",
+    "fanControl": "V272"
+  },
+  "plugin": {
+    "version": "4.0.0.0",
+    "lengthBytes": 85504,
+    "sha256": "48563298D32476BD27A8F9B7FA802474021F0EDC7C202932D21B009859BF496D"
+  },
+  "deploymentRollback": {
+    "previousVersion": "3.0.0.0",
+    "previousSha256": "D466C4EE165DD9605E8B8D54112CDAAAC76250AEBED0AFA986C6F191F8EC57CE",
+    "snapshotVerified": true
+  },
+  "offlineTests": {
+    "passed": 50,
+    "total": 50,
+    "goldenTransitionPaths": 18928,
+    "buildWarnings": 0,
+    "buildErrors": 0
+  },
+  "directHardware": {
+    "coldFirstSetMilliseconds": 49.8,
+    "adjacentSetMilliseconds": { "minimum": 13.9, "maximum": 21.3 },
+    "burst": {
+      "setCalls": 515,
+      "distinctHardwareMutations": 510,
+      "durationSeconds": 7.7,
+      "meanMilliseconds": 13.6,
+      "p95Milliseconds": 15.6,
+      "maximumMilliseconds": 45.8
+    },
+    "physicalStopRestartCycles": 3,
+    "zeroLoad": {
+      "status": "PASS",
+      "stopSetMilliseconds": 26.2,
+      "restartFloorTemperatureC": 67,
+      "restartFloorCode": 10,
+      "targetNonzeroMilliseconds": 24925.1,
+      "fan300RpmMilliseconds": 25936.7,
+      "observedTargetToTachMilliseconds": 1011.6,
+      "consecutiveSustainableSamples": 4,
+      "minimumSustainableRpm": 800,
+      "maximumCpuTemperatureC": 69
+    }
+  },
+  "fanControl": {
+    "manualLifecycleStages": 18,
+    "manualCpuZeroCycles": 3,
+    "rapidCombinedTransitionStages": 30,
+    "coolStopCurveSamples": 120,
+    "coolStopCurveCpuLoadSeconds": 60,
+    "userCurveSoakSamples": 180,
+    "userCurveCpuLoadSeconds": 120,
+    "totalMonitoredHoldSamples": 414,
+    "unresponsiveSamples": 0,
+    "missingTelemetrySamples": 0,
+    "orderlyExits": 2,
+    "cleanRelaunches": 1,
+    "pluginErrorLines": 0
+  },
+  "coolStopCurve": {
+    "status": "PASS",
+    "cpuTemperatureC": { "minimum": 63, "maximum": 86 },
+    "cpuRpm": { "minimum": 0, "maximum": 4091 },
+    "systemTemperatureC": { "minimum": 55, "maximum": 58 },
+    "systemRpm": { "minimum": 905, "maximum": 1908 },
+    "finalControlsNull": true
+  },
+  "userCurveSoak": {
+    "status": "PASS",
+    "samples": 180,
+    "cpuTemperatureC": { "minimum": 63, "maximum": 84 },
+    "cpuRpm": { "minimum": 1006, "maximum": 3494 },
+    "systemTemperatureC": { "minimum": 57, "maximum": 60 },
+    "systemRpm": { "minimum": 925, "maximum": 1891 },
+    "cpuControlPercent": { "minimum": 21.568628, "maximum": 41.17647 },
+    "systemControlPercent": { "minimum": 21.568628, "maximum": 21.568628 },
+    "finalControlsNull": true
+  },
+  "finalAuditFromLocalTime": "2026-08-04T10:49:00-07:00",
+  "newRelevantSystemEvents": 0,
+  "newRelevantApplicationEvents": 0,
+  "newLiveKernelReports": 0,
+  "observedFreeze": false,
+  "observedBlackScreen": false,
+  "finalStock": {
+    "cpuTemperatureC": 60,
+    "cpuRpm": 2469,
+    "systemTemperatureC": 56,
+    "systemRpm": 1980
+  },
+  "finalState": {
+    "fanControlRunning": false,
+    "pluginV4Deployed": true,
+    "activeConfig": "v4-disabled.json",
+    "cpuControlEnabled": false,
+    "systemControlEnabled": false,
+    "commandStepUp": 100,
+    "commandStepDown": 100,
+    "originalUserConfigUnchanged": true,
+    "rollbackSnapshotAvailable": true
+  }
+}

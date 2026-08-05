@@ -54,6 +54,51 @@ jobs:
               "-p:FanControlDir=$env:FANCONTROL_DIR" `
               -p:ContinuousIntegrationBuild=true
 
+      - name: Build diagnostic helpers
+        shell: pwsh
+        run: |
+          $projects = @(
+              ".\diagnostics\FanControl.MinisforumUM780XTX.Diagnostics.csproj",
+              ".\diagnostics\FanControlIpc\FanControlIpc.csproj",
+              ".\diagnostics\CpuBurn\CpuBurn.csproj",
+              ".\diagnostics\IsaMutexFault\IsaMutexFault.csproj"
+          )
+          foreach ($project in $projects) {
+              dotnet build $project `
+                  --configuration Release `
+                  "-p:FanControlDir=$env:FANCONTROL_DIR" `
+                  -p:ContinuousIntegrationBuild=true
+              if ($LASTEXITCODE -ne 0) {
+                  exit $LASTEXITCODE
+              }
+          }
+
+      - name: Validate diagnostics and curated evidence
+        shell: pwsh
+        run: |
+          $scripts = Get-ChildItem .\diagnostics -Recurse -File -Filter "*.ps1"
+          foreach ($script in $scripts) {
+              $tokens = $null
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                  $script.FullName,
+                  [ref]$tokens,
+                  [ref]$errors)
+              if ($errors.Count -ne 0) {
+                  $messages = $errors.Message -join "; "
+                  throw "$($script.FullName): $messages"
+              }
+          }
+
+          $results = Get-ChildItem `
+              .\diagnostics\hardware-results `
+              -Recurse -File -Filter "RESULTS.json"
+          foreach ($result in $results) {
+              Get-Content -LiteralPath $result.FullName -Raw |
+                  ConvertFrom-Json |
+                  Out-Null
+          }
+
       - name: Run hardware-free tests
         shell: pwsh
         run: |

@@ -1,15 +1,56 @@
+using System.Diagnostics;
+using System.Runtime.ExceptionServices;
+
 namespace FanControl.MinisforumUM780XTX;
 
 internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
 {
-    private static readonly TimeSpan OwnershipTimeout = TimeSpan.FromSeconds(1.5);
+    private enum CpuControlState
+    {
+        Ready,
+        Active,
+        FaultedRestored,
+        FaultedMayBeModified,
+    }
+
+    private enum SystemControlState
+    {
+        Firmware,
+        Engaging,
+        Owned,
+        Failsafe,
+        Releasing,
+        Faulted,
+    }
+
+    // Fifteen 100 ms sleeps cover the firmware selector's observed service
+    // interval while keeping each wait finite. Only the effective-temperature
+    // byte is polled; one full state read verifies the final handoff.
+    private const int SystemSelectorPollAttempts = 16;
+    private static readonly TimeSpan SystemSelectorPollDelay =
+        TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan SystemGuardMaximumGap = TimeSpan.FromSeconds(4);
     private readonly object sync = new();
     private readonly Func<HostIdentitySnapshot> hostReader;
     private readonly Func<IF7bsdTransport> transportFactory;
+    private readonly Func<long> timestamp;
+    private readonly Func<long, long, TimeSpan> elapsedTime;
+    private readonly Action<TimeSpan> sleeper;
     private IF7bsdTransport? transport;
-    private byte[]? cpuBaseline;
-    private bool cpuMayBeModified;
+    private F7bsdCpuRowState[]? cpuExpected;
+    private F7bsdCpuRowState[]? cpuRecoverySource;
+    private F7bsdCpuTransitionStep[]? cpuRecoveryPlan;
+    private bool cpuRecoveryPlanEndsAtB1;
+    private CpuControlState cpuState;
+    private byte? cpuAppliedCode;
+    // Recovery latch: set before the sentinel write and retained until a
+    // plausible firmware-owned temperature path is verified after release.
     private bool systemMayBeOwned;
+    private SystemControlState systemState;
+    private byte? systemRequestedCode;
+    private byte? systemAppliedCode;
+    private long? lastSystemGuardTick;
+    private int consecutiveOwnedTelemetryFailures;
 
     internal PawnIoF7bsdBackend()
         : this(HostIdentity.Read, static () => new PawnIoTransport())
@@ -19,9 +60,27 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
     internal PawnIoF7bsdBackend(
         Func<HostIdentitySnapshot> hostReader,
         Func<IF7bsdTransport> transportFactory)
+        : this(
+            hostReader,
+            transportFactory,
+            Stopwatch.GetTimestamp,
+            Stopwatch.GetElapsedTime,
+            static delay => Thread.Sleep(delay))
+    {
+    }
+
+    internal PawnIoF7bsdBackend(
+        Func<HostIdentitySnapshot> hostReader,
+        Func<IF7bsdTransport> transportFactory,
+        Func<long> timestamp,
+        Func<long, long, TimeSpan> elapsedTime,
+        Action<TimeSpan> sleeper)
     {
         this.hostReader = hostReader;
         this.transportFactory = transportFactory;
+        this.timestamp = timestamp;
+        this.elapsedTime = elapsedTime;
+        this.sleeper = sleeper;
     }
 
     public void Initialize()
@@ -50,14 +109,36 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
                         "The live controller is not the UM780 XTX F7BSD IT5571 profile.");
                 }
 
-                F7bsdProfile.ValidateCpuCriticalRow(
-                    candidate.Read(F7bsdProfile.CpuCriticalAddresses));
-                byte[] capturedCpu = candidate.Read(F7bsdProfile.CpuRestoreAddresses);
+                byte[] firstCpuSnapshot = candidate.Read(
+                    F7bsdProfile.CpuControlSnapshotAddresses);
+                Thread.Sleep(20);
+                byte[] secondCpuSnapshot = candidate.Read(
+                    F7bsdProfile.CpuControlSnapshotAddresses);
+                byte[] firstCpu = F7bsdProfile.ValidateCpuControlSnapshot(
+                    firstCpuSnapshot);
+                byte[] capturedCpu = F7bsdProfile.ValidateCpuControlSnapshot(
+                    secondCpuSnapshot);
+                if (!firstCpu.SequenceEqual(capturedCpu))
+                {
+                    throw new PlatformNotSupportedException(
+                        "The CPU policy changed during bounded startup capture.");
+                }
+                F7bsdProfile.ValidateSystemThresholds(
+                    candidate.Read(F7bsdProfile.SystemThresholdAddresses));
+                F7bsdProfile.ValidateStartupState(
+                    candidate.Read(F7bsdProfile.StartupStateAddresses));
 
                 transport = candidate;
-                cpuBaseline = capturedCpu;
-                cpuMayBeModified = false;
+                cpuExpected = F7bsdCpuPolicy.FromMutableBytes(capturedCpu);
+                ClearCpuRecoveryCertificate();
+                cpuState = CpuControlState.Ready;
+                cpuAppliedCode = null;
                 systemMayBeOwned = false;
+                systemState = SystemControlState.Firmware;
+                systemRequestedCode = null;
+                systemAppliedCode = null;
+                lastSystemGuardTick = null;
+                consecutiveOwnedTelemetryFailures = 0;
             }
             catch
             {
@@ -71,7 +152,44 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
     {
         lock (sync)
         {
-            return ReadStableTelemetry(ActiveTransport());
+            if (systemState == SystemControlState.Faulted && systemMayBeOwned)
+            {
+                throw new InvalidOperationException(
+                    "System ownership cleanup is pending. Only Reset or Close may " +
+                    "retry the bounded release transaction.");
+            }
+            IF7bsdTransport active = ActiveTransport();
+            F7bsdTelemetry telemetry;
+            try
+            {
+                telemetry = ReadStableTelemetry(active);
+                consecutiveOwnedTelemetryFailures = 0;
+            }
+            catch (Exception failure)
+            {
+                if (systemMayBeOwned && systemState is
+                    SystemControlState.Owned or SystemControlState.Failsafe)
+                {
+                    consecutiveOwnedTelemetryFailures++;
+                    if (consecutiveOwnedTelemetryFailures >= 3)
+                    {
+                        systemState = SystemControlState.Faulted;
+                        ThrowAfterSystemRelease(
+                            active,
+                            new IOException(
+                                "Three consecutive guarded telemetry samples failed.",
+                                failure));
+                    }
+                }
+                throw;
+            }
+
+            return telemetry with
+            {
+                CpuAppliedCode = cpuState == CpuControlState.Active
+                    ? cpuAppliedCode
+                    : null,
+            };
         }
     }
 
@@ -85,6 +203,12 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         lock (sync)
         {
             IF7bsdTransport active = ActiveTransport();
+            if (systemState == SystemControlState.Faulted && systemMayBeOwned)
+            {
+                throw new InvalidOperationException(
+                    "System ownership cleanup is pending. Only Reset or Close may " +
+                    "retry the bounded release transaction.");
+            }
             return fan switch
             {
                 F7bsdFan.Cpu => SetCpu(active, requestedCode),
@@ -102,15 +226,17 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             switch (fan)
             {
                 case F7bsdFan.Cpu:
-                    if (cpuMayBeModified)
-                    {
-                        RestoreCpu(active);
-                    }
+                    RestoreCpu(active);
                     break;
                 case F7bsdFan.System:
+                    bool wasFaulted = systemState == SystemControlState.Faulted;
                     if (systemMayBeOwned)
                     {
                         ReleaseSystem(active);
+                    }
+                    if (wasFaulted)
+                    {
+                        systemState = SystemControlState.Faulted;
                     }
                     break;
                 default:
@@ -130,81 +256,183 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             }
 
             List<Exception> errors = [];
-            try
+            if (systemMayBeOwned)
             {
-                if (systemMayBeOwned)
+                try
                 {
-                    try
-                    {
-                        ReleaseSystem(old);
-                    }
-                    catch (Exception exception)
-                    {
-                        errors.Add(exception);
-                    }
+                    ReleaseSystem(old);
                 }
-                if (cpuMayBeModified)
+                catch (Exception exception)
                 {
-                    try
-                    {
-                        RestoreCpu(old);
-                    }
-                    catch (Exception exception)
-                    {
-                        errors.Add(exception);
-                    }
+                    errors.Add(exception);
                 }
             }
-            finally
+            if (cpuState is CpuControlState.Active or
+                CpuControlState.FaultedMayBeModified)
             {
-                transport = null;
-                cpuBaseline = null;
-                cpuMayBeModified = false;
-                systemMayBeOwned = false;
-                old.Dispose();
+                try
+                {
+                    RestoreCpu(old);
+                }
+                catch (Exception exception)
+                {
+                    errors.Add(exception);
+                }
             }
 
             if (errors.Count != 0)
             {
                 throw new AggregateException("F7BSD control restoration failed.", errors);
             }
+
+            old.Dispose();
+            transport = null;
+            cpuExpected = null;
+            ClearCpuRecoveryCertificate();
+            cpuState = CpuControlState.Ready;
+            cpuAppliedCode = null;
+            systemMayBeOwned = false;
+            systemState = SystemControlState.Firmware;
+            systemRequestedCode = null;
+            systemAppliedCode = null;
+            lastSystemGuardTick = null;
+            consecutiveOwnedTelemetryFailures = 0;
         }
     }
 
     private byte SetCpu(IF7bsdTransport active, byte requestedCode)
     {
-        byte[] target = F7bsdProfile.CpuManualBytes(requestedCode);
-        if (active.Read(F7bsdProfile.CpuRestoreAddresses).SequenceEqual(target))
+        if (cpuState is CpuControlState.FaultedRestored or
+            CpuControlState.FaultedMayBeModified)
         {
+            throw new InvalidOperationException(
+                "CPU control faulted during an earlier transaction. Refresh the " +
+                "plugin after verifying stock state or restart Windows.");
+        }
+
+        F7bsdCpuRowState[] current = ActiveCpuExpected();
+        F7bsdCpuRowState[] target = F7bsdCpuPolicy.CompileTarget(requestedCode);
+        if (current.SequenceEqual(target))
+        {
+            if (cpuState == CpuControlState.Active)
+            {
+                // Preserve the confirmed request without turning a duplicate
+                // target into EC traffic.
+                cpuAppliedCode = requestedCode;
+            }
             return requestedCode;
         }
 
-        cpuMayBeModified = true;
+        return ApplyCpuTarget(active, requestedCode, current, target);
+    }
+
+    private byte ApplyCpuTarget(
+        IF7bsdTransport active,
+        byte requestedCode,
+        F7bsdCpuRowState[] current,
+        F7bsdCpuRowState[] target)
+    {
+        F7bsdCpuTransitionStep[] steps = F7bsdCpuPolicy.PlanTransition(
+            current,
+            target);
+        bool wasActive = cpuState == CpuControlState.Active;
+        SetCpuRecoveryCertificate(current, steps, false, target);
+        cpuState = CpuControlState.Active;
+        bool writeAttempted = false;
         try
         {
-            active.Write(F7bsdProfile.CpuManualWrites(requestedCode));
-            AssertCpuBytes(active, target);
+            ValidateCpuSafetyState(active.Read(F7bsdProfile.CpuSafetyStateAddresses));
+            writeAttempted = true;
+            active.WriteGuarded(
+                BuildCpuExpectations(current),
+                steps.Select(step => step.Write).ToArray(),
+                BuildCpuExpectations(target),
+                []);
+            cpuExpected = target;
+            ClearCpuRecoveryCertificate();
+            cpuAppliedCode = requestedCode;
             return requestedCode;
         }
         catch (Exception failure)
         {
-            ThrowAfterCpuRestore(active, failure);
+            if (!wasActive &&
+                (!writeAttempted || failure is EcWritePreconditionException))
+            {
+                // The first command failed before any possible write, so the
+                // exact startup B1 table is still authoritative.
+                ClearCpuRecoveryCertificate();
+                cpuAppliedCode = null;
+                cpuState = CpuControlState.FaultedRestored;
+                throw;
+            }
+
+            cpuState = CpuControlState.FaultedMayBeModified;
+            try
+            {
+                RecoverCpuToB1(active);
+            }
+            catch (Exception cleanup)
+            {
+                throw new AggregateException(
+                    "CPU control failed and OEM B1 restoration is incomplete.",
+                    failure,
+                    cleanup);
+            }
             throw;
         }
     }
 
     private byte SetSystem(IF7bsdTransport active, byte requestedCode)
     {
-        try
+        if (systemState == SystemControlState.Faulted)
         {
-            EnsureSystemOwnership(active);
-            active.Write(
-                [new EcWrite(F7bsdProfile.SystemTargetAddress, requestedCode)]);
-            AssertSystemOwnership(active, requestedCode);
+            throw new InvalidOperationException(
+                "System control faulted during an earlier transaction. Refresh " +
+                "the plugin after verified release or restart Windows.");
+        }
+
+        if (CanReturnCachedSystemRequest(requestedCode))
+        {
             return requestedCode;
         }
-        catch (Exception failure)
+
+        if (!systemMayBeOwned)
         {
+            byte[] firmwareState = active.Read(F7bsdProfile.SystemOwnershipAddresses);
+            ValidateFirmwareSystemState(firmwareState);
+            if (UnsafeSystemTemperature(firmwareState[0]) &&
+                requestedCode != F7bsdProfile.MaximumCode)
+            {
+                throw new InvalidOperationException(
+                    $"System raw temperature {firmwareState[0]} C is unsafe; only " +
+                    "the full target is allowed.");
+            }
+
+            try
+            {
+                byte[] ownedState = EngageSystemOwnership(active, firmwareState);
+                return ApplySystemRequest(active, ownedState, requestedCode);
+            }
+            catch (Exception failure)
+            {
+                systemState = SystemControlState.Faulted;
+                if (systemMayBeOwned)
+                {
+                    ThrowAfterSystemRelease(active, failure);
+                }
+                throw;
+            }
+        }
+
+        try
+        {
+            byte[] ownedState = active.Read(F7bsdProfile.SystemOwnershipAddresses);
+            ownedState = GuardSystem(active, ownedState);
+            return ApplySystemRequest(active, ownedState, requestedCode);
+        }
+        catch (Exception failure) when (systemState != SystemControlState.Faulted)
+        {
+            systemState = SystemControlState.Faulted;
             if (systemMayBeOwned)
             {
                 ThrowAfterSystemRelease(active, failure);
@@ -213,60 +441,196 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
         }
     }
 
-    private void EnsureSystemOwnership(IF7bsdTransport active)
+    private bool CanReturnCachedSystemRequest(byte requestedCode)
     {
-        byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
-        if (systemMayBeOwned &&
-            state[2] == F7bsdProfile.SystemSentinel &&
-            state[1] == F7bsdProfile.SystemSentinel)
+        if (!systemMayBeOwned || systemState != SystemControlState.Owned ||
+            systemRequestedCode != requestedCode || systemAppliedCode != requestedCode ||
+            lastSystemGuardTick is not long previous)
         {
-            return;
-        }
-        if (!systemMayBeOwned && state[2] != 0)
-        {
-            throw new InvalidOperationException(
-                "System fixed-target ownership is already active.");
-        }
-        if (state[2] is not 0 and not F7bsdProfile.SystemSentinel)
-        {
-            throw new InvalidOperationException(
-                $"Unexpected system override 0x{state[2]:X2}.");
+            return false;
         }
 
+        long current;
+        try
+        {
+            current = timestamp();
+        }
+        catch
+        {
+            return false;
+        }
+        if (current < previous)
+        {
+            return false;
+        }
+        TimeSpan elapsed;
+        try
+        {
+            elapsed = elapsedTime(previous, current);
+        }
+        catch
+        {
+            return false;
+        }
+        return elapsed >= TimeSpan.Zero && elapsed <= SystemGuardMaximumGap;
+    }
+
+    private byte ApplySystemRequest(
+        IF7bsdTransport active,
+        byte[] state,
+        byte requestedCode)
+    {
+        byte appliedCode = UnsafeSystemTemperature(state[0]) &&
+            requestedCode != F7bsdProfile.MaximumCode
+                ? F7bsdProfile.MaximumCode
+                : requestedCode;
+        if (state[3] != appliedCode)
+        {
+            state = WriteSystemTarget(active, state[3], appliedCode);
+        }
+        if (UnsafeSystemTemperature(state[0]) &&
+            appliedCode != F7bsdProfile.MaximumCode)
+        {
+            appliedCode = F7bsdProfile.MaximumCode;
+            state = WriteSystemTarget(active, state[3], appliedCode);
+        }
+        ValidateOwnedSystemState(state, appliedCode);
+
+        systemRequestedCode = requestedCode;
+        systemAppliedCode = appliedCode;
+        systemState = appliedCode == F7bsdProfile.MaximumCode &&
+            requestedCode != F7bsdProfile.MaximumCode
+                ? SystemControlState.Failsafe
+                : SystemControlState.Owned;
+        lastSystemGuardTick = timestamp();
+        return appliedCode;
+    }
+
+    private byte[] EngageSystemOwnership(IF7bsdTransport active, byte[] state)
+    {
+        ValidateFirmwareSystemState(state);
         systemMayBeOwned = true;
-        active.Write(
-            [new EcWrite(
-                F7bsdProfile.SystemTemperatureOverrideAddress,
-                F7bsdProfile.SystemSentinel)]);
-        WaitForSystemOwnership(active);
+        systemState = SystemControlState.Engaging;
+        try
+        {
+            active.WriteGuarded(
+                [new EcExpectation(F7bsdProfile.SystemTemperatureOverrideAddress, 0)],
+                [new EcWrite(
+                    F7bsdProfile.SystemTemperatureOverrideAddress,
+                    F7bsdProfile.SystemSentinel)],
+                [new EcExpectation(
+                    F7bsdProfile.SystemTemperatureOverrideAddress,
+                    F7bsdProfile.SystemSentinel)],
+                []);
+        }
+        catch (EcWritePreconditionException)
+        {
+            // No write occurs until every guarded precondition has passed.
+            systemMayBeOwned = false;
+            systemState = SystemControlState.Faulted;
+            throw;
+        }
+        return WaitForSystemOwnership(active);
+    }
+
+    private static void ValidateFirmwareSystemState(ReadOnlySpan<byte> state)
+    {
+        if (state.Length != F7bsdProfile.SystemOwnershipAddresses.Length)
+        {
+            throw new ArgumentException("Unexpected system state length.", nameof(state));
+        }
+        if (state[2] != 0)
+        {
+            throw new InvalidOperationException(
+                $"System firmware-temperature override is 0x{state[2]:X2}, not zero.");
+        }
+        if (!F7bsdProfile.PlausibleTemperature(state[1]))
+        {
+            throw new IOException(
+                "The firmware-owned system temperature path is not plausible.");
+        }
+        if (state[3] > F7bsdProfile.MaximumCode)
+        {
+            throw new IOException("The system target is outside code 0..51.");
+        }
     }
 
     private void RestoreCpu(IF7bsdTransport active)
     {
-        byte[] baseline = ActiveCpuBaseline();
-        if (!active.Read(F7bsdProfile.CpuRestoreAddresses).SequenceEqual(baseline))
+        switch (cpuState)
         {
-            active.Write(F7bsdProfile.CpuRestoreWrites(baseline));
-            AssertCpuBytes(active, baseline);
+            case CpuControlState.Ready:
+            case CpuControlState.FaultedRestored:
+                return;
+            case CpuControlState.FaultedMayBeModified:
+                RecoverCpuToB1(active);
+                return;
+            case CpuControlState.Active:
+                break;
+            default:
+                throw new InvalidOperationException("Unknown CPU control state.");
         }
-        cpuMayBeModified = false;
+
+        F7bsdCpuRowState[] current = ActiveCpuExpected();
+        F7bsdCpuRowState[] baseline = F7bsdCpuPolicy.GetB1MutableStates();
+        F7bsdCpuTransitionStep[] steps =
+            F7bsdCpuPolicy.PlanTransitionToB1(current);
+        SetCpuRecoveryCertificate(current, steps, true, baseline);
+        try
+        {
+            ValidateCpuRecoverySafetyState(
+                active.Read(F7bsdProfile.CpuSafetyStateAddresses));
+            active.WriteGuarded(
+                BuildCpuExpectations(current),
+                steps.Select(step => step.Write).ToArray(),
+                BuildCpuExpectations(baseline),
+                []);
+            cpuExpected = baseline;
+            ClearCpuRecoveryCertificate();
+            cpuState = CpuControlState.Ready;
+            cpuAppliedCode = null;
+        }
+        catch (Exception failure)
+        {
+            cpuState = CpuControlState.FaultedMayBeModified;
+            try
+            {
+                RecoverCpuToB1(active);
+            }
+            catch (Exception cleanup)
+            {
+                throw new AggregateException(
+                    "CPU reset failed and OEM B1 restoration is incomplete.",
+                    failure,
+                    cleanup);
+            }
+            throw;
+        }
     }
 
     private void ReleaseSystem(IF7bsdTransport active)
     {
+        if (!systemMayBeOwned)
+        {
+            return;
+        }
+
+        systemState = SystemControlState.Releasing;
         List<Exception> errors = [];
-        bool alreadyReleased = false;
+        bool overrideCleared = false;
+        bool healthyFirmwareState = false;
         try
         {
             byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
-            alreadyReleased = state[2] == 0 && state[1] == state[0];
+            overrideCleared = state[2] == 0;
+            healthyFirmwareState = HealthyFirmwareSystemState(state);
         }
         catch (Exception exception)
         {
             errors.Add(exception);
         }
 
-        if (!alreadyReleased)
+        if (!overrideCleared)
         {
             try
             {
@@ -283,6 +647,7 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             {
                 active.Write(
                     [new EcWrite(F7bsdProfile.SystemTemperatureOverrideAddress, 0)]);
+                overrideCleared = true;
             }
             catch (Exception exception)
             {
@@ -290,95 +655,275 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
             }
         }
 
-        try
+        if (!healthyFirmwareState)
         {
-            WaitForSystemRelease(active);
-        }
-        catch (Exception exception)
-        {
-            errors.Add(exception);
+            try
+            {
+                byte[] releasedState = WaitForSystemRelease(active);
+                overrideCleared |= releasedState[2] == 0;
+                healthyFirmwareState = HealthyFirmwareSystemState(releasedState);
+            }
+            catch (Exception exception)
+            {
+                errors.Add(exception);
+            }
         }
 
-        if (errors.Count != 0)
+        if (healthyFirmwareState)
         {
+            systemMayBeOwned = false;
+            systemRequestedCode = null;
+            systemAppliedCode = null;
+            lastSystemGuardTick = null;
+            consecutiveOwnedTelemetryFailures = 0;
+        }
+
+        if (errors.Count != 0 || !healthyFirmwareState)
+        {
+            systemState = SystemControlState.Faulted;
+            if (!healthyFirmwareState && errors.Count == 0)
+            {
+                errors.Add(new IOException(
+                    "Firmware did not resume a plausible live system-temperature path."));
+            }
             throw new AggregateException(
                 "System fixed-target ownership did not release cleanly.",
                 errors);
         }
-        systemMayBeOwned = false;
+        systemState = SystemControlState.Firmware;
     }
 
-    private void WaitForSystemOwnership(IF7bsdTransport active)
+    private byte[] WaitForSystemOwnership(IF7bsdTransport active)
     {
-        DateTime deadline = DateTime.UtcNow + OwnershipTimeout;
-        do
+        byte lastEffective = 0;
+        for (int attempt = 0; attempt < SystemSelectorPollAttempts; attempt++)
         {
-            byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
-            if (state[2] == F7bsdProfile.SystemSentinel &&
-                state[1] == F7bsdProfile.SystemSentinel)
+            lastEffective = active.Read(
+                F7bsdProfile.SystemEffectiveTemperaturePollAddresses)[0];
+            if (lastEffective == F7bsdProfile.SystemSentinel)
             {
-                return;
+                break;
             }
-            Thread.Sleep(20);
-        }
-        while (DateTime.UtcNow < deadline);
-
-        throw new IOException("Firmware did not enter system fixed-target ownership.");
-    }
-
-    private static void WaitForSystemRelease(IF7bsdTransport active)
-    {
-        DateTime deadline = DateTime.UtcNow + OwnershipTimeout;
-        do
-        {
-            byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
-            if (state[2] == 0 && state[1] == state[0])
+            if (attempt + 1 < SystemSelectorPollAttempts)
             {
-                return;
+                sleeper(SystemSelectorPollDelay);
             }
-            Thread.Sleep(20);
         }
-        while (DateTime.UtcNow < deadline);
 
-        throw new IOException("Firmware did not resume live system-temperature ownership.");
-    }
-
-    private static void AssertSystemOwnership(IF7bsdTransport active, byte expectedCode)
-    {
         byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
+        if (state[2] == F7bsdProfile.SystemSentinel &&
+            state[1] == F7bsdProfile.SystemSentinel)
+        {
+            return state;
+        }
+        throw new IOException(
+            "Firmware did not enter system fixed-target ownership after the " +
+            $"bounded selector wait; last effective byte was 0x{lastEffective:X2}, " +
+            $"final state was {DescribeSystemState(state)}.");
+    }
+
+    private byte[] WaitForSystemRelease(IF7bsdTransport active)
+    {
+        byte lastEffective = F7bsdProfile.SystemSentinel;
+        for (int attempt = 0; attempt < SystemSelectorPollAttempts; attempt++)
+        {
+            lastEffective = active.Read(
+                F7bsdProfile.SystemEffectiveTemperaturePollAddresses)[0];
+            if (F7bsdProfile.PlausibleTemperature(lastEffective))
+            {
+                break;
+            }
+            if (attempt + 1 < SystemSelectorPollAttempts)
+            {
+                sleeper(SystemSelectorPollDelay);
+            }
+        }
+
+        byte[] state = active.Read(F7bsdProfile.SystemOwnershipAddresses);
+        if (HealthyFirmwareSystemState(state))
+        {
+            return state;
+        }
+        throw new IOException(
+            "Firmware did not resume live system-temperature ownership after the " +
+            $"bounded selector wait; last effective byte was 0x{lastEffective:X2}, " +
+            $"final state was {DescribeSystemState(state)}.");
+    }
+
+    private static string DescribeSystemState(ReadOnlySpan<byte> state) =>
+        state.Length == F7bsdProfile.SystemOwnershipAddresses.Length
+            ? $"raw=0x{state[0]:X2}, effective=0x{state[1]:X2}, " +
+                $"override=0x{state[2]:X2}, target=0x{state[3]:X2}"
+            : $"an unexpected {state.Length}-byte snapshot";
+
+    private static bool HealthyFirmwareSystemState(ReadOnlySpan<byte> state) =>
+        state.Length == F7bsdProfile.SystemOwnershipAddresses.Length &&
+        state[2] == 0 &&
+        F7bsdProfile.PlausibleTemperature(state[0]) &&
+        F7bsdProfile.PlausibleTemperature(state[1]) &&
+        state[3] <= F7bsdProfile.MaximumCode;
+
+    private static void ValidateOwnedSystemState(
+        ReadOnlySpan<byte> state,
+        byte expectedTarget)
+    {
+        if (state.Length != F7bsdProfile.SystemOwnershipAddresses.Length)
+        {
+            throw new ArgumentException("Unexpected system state length.", nameof(state));
+        }
         if (state[2] != F7bsdProfile.SystemSentinel ||
-            state[1] != F7bsdProfile.SystemSentinel ||
-            state[3] != expectedCode)
+            state[1] != F7bsdProfile.SystemSentinel)
         {
-            throw new IOException("The system fixed-RPM target did not remain owned.");
+            throw new IOException("System fixed-target ownership was lost.");
+        }
+        if (state[3] != expectedTarget)
+        {
+            throw new IOException(
+                $"System target drifted from code {expectedTarget} to {state[3]}.");
         }
     }
 
-    private static void AssertCpuBytes(IF7bsdTransport active, byte[] expected)
+    private static bool UnsafeSystemTemperature(byte temperature) =>
+        !F7bsdProfile.PlausibleTemperature(temperature) ||
+        temperature >= F7bsdProfile.SystemFailsafeTemperatureC;
+
+    private static byte[] WriteSystemTarget(
+        IF7bsdTransport active,
+        byte currentCode,
+        byte targetCode)
     {
-        if (!active.Read(F7bsdProfile.CpuRestoreAddresses).SequenceEqual(expected))
-        {
-            throw new IOException("The complete CPU target table did not verify.");
-        }
+        return active.WriteGuarded(
+            [
+                new EcExpectation(
+                    F7bsdProfile.SystemTemperatureOverrideAddress,
+                    F7bsdProfile.SystemSentinel),
+                new EcExpectation(
+                    F7bsdProfile.SystemEffectiveTemperatureAddress,
+                    F7bsdProfile.SystemSentinel),
+                new EcExpectation(F7bsdProfile.SystemTargetAddress, currentCode),
+            ],
+            [new EcWrite(F7bsdProfile.SystemTargetAddress, targetCode)],
+            [
+                new EcExpectation(
+                    F7bsdProfile.SystemTemperatureOverrideAddress,
+                    F7bsdProfile.SystemSentinel),
+                new EcExpectation(
+                    F7bsdProfile.SystemEffectiveTemperatureAddress,
+                    F7bsdProfile.SystemSentinel),
+                new EcExpectation(F7bsdProfile.SystemTargetAddress, targetCode),
+            ],
+            F7bsdProfile.SystemOwnershipAddresses);
     }
 
-    private void ThrowAfterCpuRestore(IF7bsdTransport active, Exception failure)
+    private void RecoverCpuToB1(IF7bsdTransport active)
     {
-        try
+        byte[] snapshot = active.Read(F7bsdProfile.CpuRuntimeSnapshotAddresses);
+        int configurationLength = F7bsdProfile.CpuConfigurationAddresses.Length;
+        int safetyLength = F7bsdProfile.CpuSafetyStateAddresses.Length;
+        byte selector = F7bsdProfile.ValidateCpuConfiguration(
+            snapshot.AsSpan(0, configurationLength));
+        if (selector != F7bsdCpuPolicy.Selector)
         {
-            RestoreCpu(active);
+            throw new IOException(
+                "CPU recovery refused because the firmware profile is no longer B1.");
         }
-        catch (Exception cleanup)
+        ValidateCpuRecoverySafetyState(
+            snapshot.AsSpan(configurationLength, safetyLength));
+        F7bsdCpuRowState[] current = F7bsdCpuPolicy.FromMutableBytes(
+            snapshot.AsSpan(configurationLength + safetyLength));
+        F7bsdCpuRowState[] baseline = F7bsdCpuPolicy.GetB1MutableStates();
+        if (current.SequenceEqual(baseline))
         {
-            throw new AggregateException(
-                "CPU control failed and baseline restoration was incomplete.",
-                failure,
-                cleanup);
+            CompleteCpuRecovery(baseline);
+            return;
         }
+
+        F7bsdCpuRowState[] source = cpuRecoverySource ?? throw new IOException(
+            "CPU recovery has no issued-transaction source certificate.");
+        F7bsdCpuTransitionStep[] issuedPlan = cpuRecoveryPlan ?? throw new IOException(
+            "CPU recovery has no issued-transaction plan certificate.");
+        if (!F7bsdCpuPolicy.TryMatchTransitionPrefix(
+            source,
+            issuedPlan,
+            current,
+            out int completedStepCount))
+        {
+            throw new IOException(
+                "CPU recovery refused because the mutable table is not an exact " +
+                "prefix of the issued transaction.");
+        }
+
+        // Resume an interrupted B1 recovery by its exact suffix. For an
+        // interrupted control mutation, the observed table was certified above;
+        // plan directly from that prefix to B1 instead of reversing old writes.
+        F7bsdCpuTransitionStep[] recovery = cpuRecoveryPlanEndsAtB1
+            ? issuedPlan[completedStepCount..]
+            : F7bsdCpuPolicy.PlanTransitionToB1(current);
+        if (recovery.Length == 0)
+        {
+            throw new IOException(
+                "A non-B1 CPU table produced an empty certified recovery plan.");
+        }
+
+        // Replace the original mutation certificate before the first recovery
+        // write. A second interruption can then resume the exact remaining
+        // suffix instead of re-planning from an arbitrary intermediate table.
+        SetCpuRecoveryCertificate(current, recovery, true, baseline);
+        active.WriteGuarded(
+            BuildCpuExpectations(current),
+            recovery.Select(step => step.Write).ToArray(),
+            BuildCpuExpectations(baseline),
+            []);
+        CompleteCpuRecovery(baseline);
+    }
+
+    private void SetCpuRecoveryCertificate(
+        ReadOnlySpan<F7bsdCpuRowState> source,
+        ReadOnlySpan<F7bsdCpuTransitionStep> plan,
+        bool endsAtB1,
+        ReadOnlySpan<F7bsdCpuRowState> expectedDestination)
+    {
+        F7bsdCpuRowState[] materialized =
+            F7bsdCpuPolicy.MaterializeTransitionPrefix(
+                source,
+                plan,
+                plan.Length);
+        if (!materialized.AsSpan().SequenceEqual(expectedDestination))
+        {
+            throw new InvalidOperationException(
+                "The issued CPU transaction does not materialize its destination.");
+        }
+        if (endsAtB1 &&
+            !materialized.AsSpan().SequenceEqual(
+                F7bsdCpuPolicy.GetB1MutableStates()))
+        {
+            throw new InvalidOperationException(
+                "A CPU recovery certificate does not terminate at exact B1.");
+        }
+
+        cpuRecoverySource = source.ToArray();
+        cpuRecoveryPlan = plan.ToArray();
+        cpuRecoveryPlanEndsAtB1 = endsAtB1;
+    }
+
+    private void ClearCpuRecoveryCertificate()
+    {
+        cpuRecoverySource = null;
+        cpuRecoveryPlan = null;
+        cpuRecoveryPlanEndsAtB1 = false;
+    }
+
+    private void CompleteCpuRecovery(F7bsdCpuRowState[] baseline)
+    {
+        cpuExpected = baseline;
+        ClearCpuRecoveryCertificate();
+        cpuAppliedCode = null;
+        cpuState = CpuControlState.FaultedRestored;
     }
 
     private void ThrowAfterSystemRelease(IF7bsdTransport active, Exception failure)
     {
+        systemState = SystemControlState.Faulted;
         try
         {
             ReleaseSystem(active);
@@ -390,25 +935,210 @@ internal sealed class PawnIoF7bsdBackend : IF7bsdBackend
                 failure,
                 cleanup);
         }
+        systemState = SystemControlState.Faulted;
+        ExceptionDispatchInfo.Capture(failure).Throw();
+        throw new UnreachableException();
     }
 
     private IF7bsdTransport ActiveTransport() => transport ??
         throw new InvalidOperationException("The F7BSD backend is not initialized.");
 
-    private byte[] ActiveCpuBaseline() => cpuBaseline ??
-        throw new InvalidOperationException("The CPU baseline is unavailable.");
+    private F7bsdCpuRowState[] ActiveCpuExpected() => cpuExpected ??
+        throw new InvalidOperationException("The expected CPU table is unavailable.");
 
-    private static F7bsdTelemetry ReadStableTelemetry(IF7bsdTransport active)
+    private static EcExpectation[] BuildCpuExpectations(
+        ReadOnlySpan<F7bsdCpuRowState> states)
     {
-        for (int attempt = 0; attempt < 16; attempt++)
+        if (states.Length != F7bsdCpuPolicy.NormalRowCount)
         {
-            if (F7bsdTelemetryDecoder.TryDecode(
-                active.Read(F7bsdProfile.TelemetryAddresses),
-                out F7bsdTelemetry? telemetry))
+            throw new ArgumentException("Unexpected CPU table length.", nameof(states));
+        }
+
+        List<EcExpectation> expectations =
+        [
+            new(F7bsdProfile.CpuProfileSelectorAddress, F7bsdCpuPolicy.Selector),
+            new(F7bsdProfile.CpuTemperatureOverrideAddress, 0),
+        ];
+        for (int row = 0; row < F7bsdCpuPolicy.NormalRowCount; row++)
+        {
+            F7bsdCpuPolicyRow stock = F7bsdCpuPolicy.GetB1Row(row);
+            ushort baseAddress = F7bsdProfile.CpuBaseAddresses[row];
+            expectations.Add(new((ushort)(baseAddress + 1), stock.Upper));
+            expectations.Add(new((ushort)(baseAddress + 2), stock.Lower));
+        }
+        F7bsdCpuPolicyRow critical = F7bsdCpuPolicy.GetB1Row(7);
+        byte[] criticalValues =
+            [critical.Base, critical.Upper, critical.Lower, critical.Slope];
+        for (int index = 0; index < F7bsdProfile.CpuCriticalAddresses.Length; index++)
+        {
+            expectations.Add(new(
+                F7bsdProfile.CpuCriticalAddresses[index],
+                criticalValues[index]));
+        }
+        byte[] mutable = F7bsdCpuPolicy.ToMutableBytes(states);
+        for (int index = 0; index < F7bsdProfile.CpuRestoreAddresses.Length; index++)
+        {
+            expectations.Add(new(
+                F7bsdProfile.CpuRestoreAddresses[index],
+                mutable[index]));
+        }
+        return expectations.ToArray();
+    }
+
+    private static void ValidateCpuSafetyState(ReadOnlySpan<byte> values)
+    {
+        ValidateCpuRecoverySafetyState(values);
+        if (values[3] > F7bsdProfile.MaximumCode)
+        {
+            throw new IOException("The CPU target is outside code 0..51.");
+        }
+    }
+
+    private static void ValidateCpuRecoverySafetyState(ReadOnlySpan<byte> values)
+    {
+        if (values.Length != F7bsdProfile.CpuSafetyStateAddresses.Length)
+        {
+            throw new ArgumentException("Unexpected CPU safety-state length.", nameof(values));
+        }
+        if (!F7bsdProfile.PlausibleTemperature(values[0]) ||
+            !F7bsdProfile.PlausibleTemperature(values[1]))
+        {
+            throw new IOException("The CPU temperature path is not plausible.");
+        }
+        if (values[2] != 0)
+        {
+            throw new IOException("The CPU firmware-temperature override is active.");
+        }
+
+        // 0x0884 is a firmware output, not a host-owned setting. When a stale
+        // selector row is evaluated immediately after a large cooling/resume
+        // jump, the EC's unsigned slope arithmetic can transiently exceed 51.
+        // Restoration must still be able to replace an exactly certified
+        // mutable table with exact B1. Normal target mutations retain the
+        // stricter 0..51 check above.
+    }
+
+    private F7bsdTelemetry ReadStableTelemetry(IF7bsdTransport active)
+    {
+        bool superviseSystem = systemMayBeOwned;
+        ushort[] addresses = superviseSystem
+            ? F7bsdProfile.RuntimeTelemetryAddresses
+            : F7bsdProfile.TelemetryAddresses;
+        byte[] sample;
+        try
+        {
+            sample = active.Read(addresses);
+        }
+        catch (Exception failure)
+        {
+            if (systemMayBeOwned)
             {
-                return telemetry!;
+                systemState = SystemControlState.Faulted;
+                ThrowAfterSystemRelease(active, failure);
+            }
+            throw;
+        }
+
+        if (superviseSystem)
+        {
+            sample = ReplaceSystemState(sample, GuardSystem(
+                active,
+                sample.AsSpan(7, 4).ToArray()));
+        }
+        int cpuRpm = ReadStableCounter(
+            active,
+            sample.AsSpan(0, 3),
+            F7bsdProfile.CpuTachAddresses,
+            "CPU");
+        int systemRpm = ReadStableCounter(
+            active,
+            sample.AsSpan(3, 3),
+            F7bsdProfile.SystemTachAddresses,
+            "system");
+        return new F7bsdTelemetry(
+            cpuRpm,
+            systemRpm,
+            sample[6],
+            sample[7],
+            superviseSystem ? systemAppliedCode : null);
+    }
+
+    private byte[] GuardSystem(IF7bsdTransport active, byte[] state)
+    {
+        try
+        {
+            byte expectedTarget = systemAppliedCode ?? throw new IOException(
+                "System ownership is latched without a verified applied target.");
+            long current = timestamp();
+            if (lastSystemGuardTick is not long previous || current < previous)
+            {
+                throw new IOException("System control supervision timing is invalid.");
+            }
+
+            TimeSpan elapsed = elapsedTime(previous, current);
+            if (elapsed < TimeSpan.Zero || elapsed > SystemGuardMaximumGap)
+            {
+                throw new IOException(
+                    $"System control supervision gap was {elapsed.TotalSeconds:F3} seconds.");
+            }
+
+            ValidateOwnedSystemState(state, expectedTarget);
+            if (UnsafeSystemTemperature(state[0]) &&
+                expectedTarget != F7bsdProfile.MaximumCode)
+            {
+                state = WriteSystemTarget(
+                    active,
+                    state[3],
+                    F7bsdProfile.MaximumCode);
+                ValidateOwnedSystemState(state, F7bsdProfile.MaximumCode);
+                systemAppliedCode = F7bsdProfile.MaximumCode;
+                systemState = SystemControlState.Failsafe;
+            }
+            lastSystemGuardTick = current;
+            return state;
+        }
+        catch (Exception failure)
+        {
+            systemState = SystemControlState.Faulted;
+            ThrowAfterSystemRelease(active, failure);
+            throw new UnreachableException();
+        }
+    }
+
+    private static byte[] ReplaceSystemState(byte[] telemetry, byte[] state)
+    {
+        if (telemetry.Length != F7bsdProfile.RuntimeTelemetryAddresses.Length ||
+            state.Length != F7bsdProfile.SystemOwnershipAddresses.Length)
+        {
+            throw new ArgumentException("Unexpected runtime telemetry state length.");
+        }
+        state.CopyTo(telemetry, 7);
+        return telemetry;
+    }
+
+    private static int ReadStableCounter(
+        IF7bsdTransport active,
+        ReadOnlySpan<byte> initial,
+        ushort[] addresses,
+        string name)
+    {
+        if (F7bsdTelemetryDecoder.TryDecodeCounter(initial, out int rpm))
+        {
+            return rpm;
+        }
+
+        // Three attempts total: the initial combined sample and at most two
+        // retries of only the counter which crossed a low-byte rollover.
+        for (int retry = 0; retry < 2; retry++)
+        {
+            if (F7bsdTelemetryDecoder.TryDecodeCounter(
+                active.Read(addresses),
+                out rpm))
+            {
+                return rpm;
             }
         }
-        throw new IOException("The EC tachometer counters did not produce a stable sample.");
+        throw new IOException(
+            $"The EC {name} tachometer did not produce a stable sample.");
     }
 }

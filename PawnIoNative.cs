@@ -1,9 +1,28 @@
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using Microsoft.Win32;
 
 namespace FanControl.MinisforumUM780XTX;
 
 internal readonly record struct EcWrite(ushort Address, byte Value);
+
+internal readonly record struct EcExpectation(ushort Address, byte Value);
+
+internal sealed class EcWritePreconditionException(
+    ushort address,
+    byte expected,
+    byte actual) : IOException(
+        $"EC write precondition failed at 0x{address:X4}: expected " +
+        $"0x{expected:X2}, read 0x{actual:X2}.")
+{
+    internal ushort Address { get; } = address;
+
+    internal byte Expected { get; } = expected;
+
+    internal byte Actual { get; } = actual;
+}
 
 internal interface IF7bsdTransport : IDisposable
 {
@@ -12,44 +31,86 @@ internal interface IF7bsdTransport : IDisposable
     byte[] Read(ushort[] addresses);
 
     void Write(EcWrite[] writes);
+
+    byte[] WriteGuarded(
+        EcExpectation[] before,
+        EcWrite[] writes,
+        EcExpectation[] after,
+        ushort[] resultAddresses);
+}
+
+internal interface IPawnIoExecutor : IDisposable
+{
+    ulong[] Execute(string name, ulong[] input, int outputCount);
+}
+
+internal interface IIsaMutex : IDisposable
+{
+    bool WaitOne(TimeSpan timeout);
+
+    void ReleaseMutex();
+}
+
+internal sealed class NamedIsaMutex : IIsaMutex
+{
+    private readonly Mutex mutex = new(false, F7bsdProfile.IsaMutexName);
+
+    public bool WaitOne(TimeSpan timeout) => mutex.WaitOne(timeout);
+
+    public void ReleaseMutex() => mutex.ReleaseMutex();
+
+    public void Dispose() => mutex.Dispose();
 }
 
 internal sealed class PawnIoTransport : IF7bsdTransport
 {
-    private readonly Mutex isaMutex = new(false, F7bsdProfile.IsaMutexName);
-    private readonly PawnIoNative native;
-    private volatile bool abandoned;
+    private enum TransportState
+    {
+        Healthy,
+        Poisoned,
+        Disposed,
+    }
+
+    private static readonly TimeSpan IsaTimeout = TimeSpan.FromSeconds(1);
+    private readonly IIsaMutex isaMutex;
+    private readonly IPawnIoExecutor native;
+    private TransportState state;
+    private Exception? poisonCause;
 
     internal PawnIoTransport()
     {
-        string pawnIoPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-            "PawnIO",
-            "PawnIOLib.dll");
-        native = new PawnIoNative(pawnIoPath);
+        NamedIsaMutex mutex = new();
+        PawnIoNative? candidate = null;
         try
         {
-            native.OpenAndLoad(LoadLpcModule());
+            VerifyPawnIoDriver();
+            string pawnIoPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "PawnIO",
+                "PawnIOLib.dll");
+            candidate = new PawnIoNative(pawnIoPath);
+            candidate.OpenAndLoad(LoadLpcModule());
+            isaMutex = mutex;
+            native = candidate;
         }
         catch
         {
-            native.Dispose();
-            isaMutex.Dispose();
+            candidate?.Dispose();
+            mutex.Dispose();
             throw;
         }
+    }
+
+    internal PawnIoTransport(IPawnIoExecutor native, IIsaMutex isaMutex)
+    {
+        this.native = native ?? throw new ArgumentNullException(nameof(native));
+        this.isaMutex = isaMutex ?? throw new ArgumentNullException(nameof(isaMutex));
     }
 
     public byte[] ReadPnpIdentity() => RunIsa(() =>
     {
         SelectSlot();
-        try
-        {
-            return ReadPnpIdentityUnlocked();
-        }
-        finally
-        {
-            ParkPnp();
-        }
+        return ReadPnpIdentityUnlocked();
     });
 
     public byte[] Read(ushort[] addresses)
@@ -59,94 +120,142 @@ internal sealed class PawnIoTransport : IF7bsdTransport
         return RunIsa(() =>
         {
             SelectSlot();
-            try
-            {
-                return addresses.Select(ReadByte).ToArray();
-            }
-            finally
-            {
-                Park();
-            }
+            return addresses.Select(ReadByte).ToArray();
         });
     }
 
     public void Write(EcWrite[] writes)
     {
+        WriteGuarded([], writes, [], []);
+    }
+
+    public byte[] WriteGuarded(
+        EcExpectation[] before,
+        EcWrite[] writes,
+        EcExpectation[] after,
+        ushort[] resultAddresses)
+    {
+        ArgumentNullException.ThrowIfNull(before);
         ArgumentNullException.ThrowIfNull(writes);
+        ArgumentNullException.ThrowIfNull(after);
+        ArgumentNullException.ThrowIfNull(resultAddresses);
         F7bsdProfile.AssertWritesAllowed(writes);
-        RunIsa(() =>
+        F7bsdProfile.AssertReadsAllowed(before.Select(item => item.Address));
+        F7bsdProfile.AssertReadsAllowed(after.Select(item => item.Address));
+        F7bsdProfile.AssertReadsAllowed(resultAddresses);
+        return RunIsa(() =>
         {
             SelectSlot();
-            try
+            AssertPnpIdentity();
+            AssertControllerProfile();
+            foreach (EcExpectation expectation in before)
             {
-                AssertPnpIdentity();
-                AssertControllerProfile();
-                foreach (EcWrite write in writes)
-                {
-                    WriteByte(write.Address, write.Value);
-                    Verify(write, "immediate");
-                }
-                foreach (IGrouping<ushort, EcWrite> group in writes.GroupBy(
-                    write => write.Address))
-                {
-                    Verify(group.Last(), "final aggregate");
-                }
+                AssertExpectation(expectation, "precondition");
             }
-            finally
+            foreach (EcWrite write in writes)
             {
-                Park();
+                WriteByte(write.Address, write.Value);
+                Verify(write, "immediate");
             }
-            return 0;
+            foreach (EcExpectation expectation in after)
+            {
+                AssertExpectation(expectation, "postcondition");
+            }
+            return resultAddresses.Select(ReadByte).ToArray();
         });
     }
 
     public void Dispose()
     {
-        native.Dispose();
-        isaMutex.Dispose();
+        if (state == TransportState.Disposed)
+        {
+            return;
+        }
+        state = TransportState.Disposed;
+
+        List<Exception> failures = [];
+        try
+        {
+            native.Dispose();
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
+        try
+        {
+            isaMutex.Dispose();
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
+        if (failures.Count != 0)
+        {
+            throw new AggregateException("PawnIO transport disposal failed.", failures);
+        }
     }
 
     private T RunIsa<T>(Func<T> action)
     {
-        if (abandoned)
-        {
-            throw new InvalidOperationException(
-                "The ISA mutex was abandoned. Restart Windows before accessing the EC again.");
-        }
+        EnsureHealthy();
 
         bool held = false;
+        T result = default!;
+        Exception? failure = null;
         try
         {
             try
             {
-                held = isaMutex.WaitOne(TimeSpan.FromSeconds(5));
+                held = isaMutex.WaitOne(IsaTimeout);
             }
-            catch (AbandonedMutexException)
+            catch (AbandonedMutexException exception)
             {
                 held = true;
-                abandoned = true;
-                throw new InvalidOperationException(
-                    "The ISA mutex was abandoned. Restart Windows before accessing the EC again.");
+                Poison(exception);
+                failure = AmbiguousStateException(
+                    "The ISA mutex was abandoned.",
+                    exception);
             }
 
-            if (!held)
+            if (failure is null && !held)
             {
                 throw new TimeoutException("Timed out acquiring the ISA mutex.");
             }
-            if (abandoned)
+            if (failure is null)
             {
-                throw new InvalidOperationException(
-                    "The ISA mutex was abandoned. Restart Windows before accessing the EC again.");
+                result = action();
             }
-            return action();
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
         }
         finally
         {
             if (held)
             {
-                isaMutex.ReleaseMutex();
+                try
+                {
+                    isaMutex.ReleaseMutex();
+                }
+                catch (Exception releaseFailure)
+                {
+                    Poison(releaseFailure);
+                    failure = Combine(
+                        failure,
+                        AmbiguousStateException(
+                            "Releasing the ISA mutex failed.",
+                            releaseFailure));
+                }
             }
         }
+
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+        return result;
     }
 
     private void AssertControllerProfile()
@@ -171,11 +280,16 @@ internal sealed class PawnIoTransport : IF7bsdTransport
     }
 
     private byte[] ReadPnpIdentityUnlocked() => Enumerable.Range(0x20, 3)
-        .Select(register => checked((byte)native.Execute(
+        .Select(ReadPnpRegister)
+        .ToArray();
+
+    private byte ReadPnpRegister(int register) => RunParked(
+        () => checked((byte)Execute(
             "ioctl_superio_inb",
             [(ulong)register],
-            1)[0]))
-        .ToArray();
+            1)[0]),
+        ParkPnp,
+        $"PNP register 0x{register:X2}");
 
     private void Verify(EcWrite write, string phase)
     {
@@ -188,21 +302,44 @@ internal sealed class PawnIoTransport : IF7bsdTransport
         }
     }
 
-    private void SelectSlot() => native.Execute("ioctl_select_slot", [0], 0);
-
-    private byte ReadByte(ushort address)
+    private void AssertExpectation(EcExpectation expectation, string phase)
     {
-        SetAddress(address);
-        Out(0x2e, 0x12);
-        return checked((byte)In(0x2f));
+        byte actual = ReadByte(expectation.Address);
+        if (actual != expectation.Value)
+        {
+            if (phase == "precondition")
+            {
+                throw new EcWritePreconditionException(
+                    expectation.Address,
+                    expectation.Value,
+                    actual);
+            }
+            throw new IOException(
+                $"EC write {phase} failed at 0x{expectation.Address:X4}: " +
+                $"expected 0x{expectation.Value:X2}, read 0x{actual:X2}.");
+        }
     }
 
-    private void WriteByte(ushort address, byte value)
-    {
-        SetAddress(address);
-        Out(0x2e, 0x12);
-        Out(0x2f, value);
-    }
+    private void SelectSlot() => Execute("ioctl_select_slot", [0], 0);
+
+    private byte ReadByte(ushort address) => RunParked(() =>
+        {
+            SetAddress(address);
+            Out(0x2e, 0x12);
+            return checked((byte)In(0x2f));
+        },
+        Park,
+        $"EC read 0x{address:X4}");
+
+    private void WriteByte(ushort address, byte value) => RunParked(() =>
+        {
+            SetAddress(address);
+            Out(0x2e, 0x12);
+            Out(0x2f, value);
+            return 0;
+        },
+        Park,
+        $"EC write 0x{address:X4}");
 
     private void SetAddress(ushort address)
     {
@@ -214,23 +351,115 @@ internal sealed class PawnIoTransport : IF7bsdTransport
 
     private void Park()
     {
+        Exception? failure = null;
         try
         {
             Out(0x2e, 0x10);
         }
-        finally
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+        try
         {
             ParkPnp();
         }
+        catch (Exception exception)
+        {
+            failure = Combine(failure, exception);
+        }
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
     }
 
-    private void ParkPnp() => native.Execute("ioctl_pio_outb", [0x2e, 0x20], 0);
+    private void ParkPnp() => Execute("ioctl_pio_outb", [0x2e, 0x20], 0);
 
     private ulong In(ulong port) =>
-        native.Execute("ioctl_superio_inb", [port], 1)[0];
+        Execute("ioctl_superio_inb", [port], 1)[0];
 
     private void Out(ulong port, ulong value) =>
-        native.Execute("ioctl_superio_outb", [port, value], 0);
+        Execute("ioctl_superio_outb", [port, value], 0);
+
+    private ulong[] Execute(string name, ulong[] input, int outputCount)
+    {
+        try
+        {
+            return native.Execute(name, input, outputCount);
+        }
+        catch (Exception exception)
+        {
+            Poison(exception);
+            throw;
+        }
+    }
+
+    private T RunParked<T>(Func<T> body, Action park, string operation)
+    {
+        T result = default!;
+        Exception? failure = null;
+        try
+        {
+            result = body();
+        }
+        catch (Exception exception)
+        {
+            Poison(exception);
+            failure = exception;
+        }
+        try
+        {
+            park();
+        }
+        catch (Exception exception)
+        {
+            Poison(exception);
+            failure = Combine(failure, exception);
+        }
+        if (failure is not null)
+        {
+            throw AmbiguousStateException(
+                $"{operation} did not complete with verified parking.",
+                failure);
+        }
+        return result;
+    }
+
+    private void EnsureHealthy()
+    {
+        if (state == TransportState.Disposed)
+        {
+            throw new ObjectDisposedException(nameof(PawnIoTransport));
+        }
+        if (state == TransportState.Poisoned)
+        {
+            throw AmbiguousStateException(
+                "PawnIO transport was poisoned by an earlier native or parking failure.",
+                poisonCause);
+        }
+    }
+
+    private void Poison(Exception exception)
+    {
+        if (state == TransportState.Healthy)
+        {
+            state = TransportState.Poisoned;
+            poisonCause = exception;
+        }
+    }
+
+    private static InvalidOperationException AmbiguousStateException(
+        string detail,
+        Exception? inner) => new(
+            detail + " EC selector state is ambiguous; restart Windows before " +
+            "accessing the controller again.",
+            inner);
+
+    private static Exception Combine(Exception? first, Exception second) =>
+        first is null
+            ? second
+            : new AggregateException(first, second);
 
     private static byte[] LoadLpcModule()
     {
@@ -244,16 +473,63 @@ internal sealed class PawnIoTransport : IF7bsdTransport
         Assembly assembly = AppDomain.CurrentDomain.GetAssemblies()
             .FirstOrDefault(item => item.GetName().Name == "LibreHardwareMonitorLib") ??
             Assembly.LoadFrom(path);
+        VerifySha256(
+            assembly.Location,
+            F7bsdProfile.LibreHardwareMonitorSha256,
+            "LibreHardwareMonitor assembly");
         using Stream stream = assembly.GetManifestResourceStream(
             F7bsdProfile.LpcResourceName) ?? throw new InvalidOperationException(
                 $"PawnIO resource was not found: {F7bsdProfile.LpcResourceName}");
         byte[] module = new byte[checked((int)stream.Length)];
         stream.ReadExactly(module);
+        string moduleHash = Convert.ToHexString(SHA256.HashData(module));
+        if (!string.Equals(
+            moduleHash,
+            F7bsdProfile.LpcModuleSha256,
+            StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The embedded PawnIO LPC module does not match the reviewed build.");
+        }
         return module;
+    }
+
+    private static void VerifySha256(string path, string expected, string description)
+    {
+        using FileStream stream = File.OpenRead(path);
+        string actual = Convert.ToHexString(SHA256.HashData(stream));
+        if (!string.Equals(actual, expected, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"The {description} does not match the reviewed build.");
+        }
+    }
+
+    private static void VerifyPawnIoDriver()
+    {
+        const string serviceKey =
+            @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\PawnIO";
+        string imagePath = Convert.ToString(
+            Registry.GetValue(serviceKey, "ImagePath", null))?.Trim().Trim('"') ??
+            throw new InvalidOperationException("The PawnIO driver service is not installed.");
+        const string systemRootPrefix = @"\SystemRoot\";
+        string resolved = imagePath.StartsWith(
+            systemRootPrefix,
+            StringComparison.OrdinalIgnoreCase)
+                ? Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    imagePath[systemRootPrefix.Length..])
+                : imagePath.StartsWith(@"\??\", StringComparison.Ordinal)
+                    ? imagePath[4..]
+                    : imagePath;
+        VerifySha256(
+            resolved,
+            F7bsdProfile.PawnIoDriverSha256,
+            "PawnIO driver");
     }
 }
 
-internal sealed class PawnIoNative : IDisposable
+internal sealed class PawnIoNative : IPawnIoExecutor
 {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int VersionDelegate(out uint version);
@@ -287,6 +563,7 @@ internal sealed class PawnIoNative : IDisposable
 
     internal PawnIoNative(string libraryPath)
     {
+        VerifyLibrary(libraryPath);
         library = NativeLibrary.Load(libraryPath);
         try
         {
@@ -330,7 +607,7 @@ internal sealed class PawnIoNative : IDisposable
         }
     }
 
-    internal ulong[] Execute(string name, ulong[] input, int outputCount)
+    public ulong[] Execute(string name, ulong[] input, int outputCount)
     {
         ulong[] output = new ulong[outputCount];
         Check(
@@ -367,6 +644,20 @@ internal sealed class PawnIoNative : IDisposable
 
     private T Export<T>(string name) where T : Delegate =>
         Marshal.GetDelegateForFunctionPointer<T>(NativeLibrary.GetExport(library, name));
+
+    private static void VerifyLibrary(string path)
+    {
+        using FileStream stream = File.OpenRead(path);
+        string actual = Convert.ToHexString(SHA256.HashData(stream));
+        if (!string.Equals(
+            actual,
+            F7bsdProfile.PawnIoLibrarySha256,
+            StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "PawnIOLib.dll does not match the reviewed 2.2.0 build.");
+        }
+    }
 
     private static void Check(int result, string operation)
     {
