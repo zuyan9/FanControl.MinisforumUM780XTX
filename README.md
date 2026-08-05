@@ -132,7 +132,7 @@ cooperative. Software that ignores it can still race this plugin.
 
 1. Install Fan Control V272 with PawnIO enabled.
 2. Build the plugin or extract `FanControl.MinisforumUM780XTX.dll` from the
-   release ZIP.
+   ZIP on [GitHub Releases](https://github.com/zuyan9/FanControl.MinisforumUM780XTX/releases).
 3. In Fan Control, use **Settings > Plugins > Install plugin...** and select the
    DLL.
 4. Refresh sensors and configure the two paired controls.
@@ -196,6 +196,37 @@ directory explicitly:
 ```powershell
 dotnet build -c Release `
   "-p:FanControlDir=C:\path\to\FanControl_272_net_10_0"
+```
+
+To assign a version to a local build, pass the same `X.Y.Z` value used for a
+release:
+
+```powershell
+dotnet build -c Release `
+  "-p:FanControlDir=C:\path\to\FanControl_272_net_10_0" `
+  -p:Version=4.1.0
+```
+
+### GitHub Actions releases
+
+Pushes and pull requests to the default branch run the complete hardware-free
+build, diagnostics validation, test, version-verification, and packaging flow.
+Each run retains `FanControl.MinisforumUM780XTX.zip` as a workflow artifact.
+
+After the workflow is present on the repository's default branch, a maintainer
+can publish a release from **Actions > Build and release > Run workflow**:
+
+1. Select the default branch.
+2. Enter a new stable version in `X.Y.Z` form, without a leading `v`.
+3. Run the workflow.
+
+The workflow performs the same checks, verifies that the DLL reports the
+requested version, creates tag and release `vX.Y.Z` at the exact tested commit,
+and attaches the one-DLL ZIP. An existing tag is rejected. The equivalent
+GitHub CLI command is:
+
+```powershell
+gh workflow run build.yml --ref master -f version=4.1.0
 ```
 
 The offline suite checks every v4 CPU request over both thermal paths, one-row

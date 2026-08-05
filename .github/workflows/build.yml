@@ -1,4 +1,4 @@
-name: Build
+name: Build and release
 
 on:
   push:
@@ -6,17 +6,63 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without "v" (for example, 4.1.0)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
 jobs:
   build:
+    name: Build and test
     runs-on: windows-latest
+    outputs:
+      publish_release: ${{ steps.version.outputs.publish_release }}
+      release_version: ${{ steps.version.outputs.release_version }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Select plugin version
+        id: version
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+              $defaultRef = "refs/heads/$env:DEFAULT_BRANCH"
+              if ($env:WORKFLOW_REF -ne $defaultRef) {
+                  throw "Releases must run from the default branch ($env:DEFAULT_BRANCH)."
+              }
+
+              $version = $env:REQUESTED_VERSION.Trim()
+              if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+                  throw "Version must use X.Y.Z syntax without a leading v, for example 4.1.0."
+              }
+              $publishRelease = "true"
+          }
+          else {
+              $version = "0.0.0-ci.$env:GITHUB_RUN_NUMBER"
+              $publishRelease = "false"
+          }
+
+          "PLUGIN_VERSION=$version" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "publish_release=$publishRelease" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release_version=$version" |
+              Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v6
@@ -52,6 +98,7 @@ jobs:
           dotnet build .\FanControl.MinisforumUM780XTX.csproj `
               --configuration Release `
               "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              "-p:Version=$env:PLUGIN_VERSION" `
               -p:ContinuousIntegrationBuild=true
 
       - name: Build diagnostic helpers
@@ -67,6 +114,7 @@ jobs:
               dotnet build $project `
                   --configuration Release `
                   "-p:FanControlDir=$env:FANCONTROL_DIR" `
+                  "-p:Version=$env:PLUGIN_VERSION" `
                   -p:ContinuousIntegrationBuild=true
               if ($LASTEXITCODE -ne 0) {
                   exit $LASTEXITCODE
@@ -106,7 +154,35 @@ jobs:
               --project .\tests\FanControl.MinisforumUM780XTX.Tests.csproj `
               --configuration Release `
               "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              "-p:Version=$env:PLUGIN_VERSION" `
               -p:ContinuousIntegrationBuild=true
+
+      - name: Verify plugin version
+        shell: pwsh
+        run: |
+          $plugin = Join-Path $env:GITHUB_WORKSPACE `
+              "bin\Release\net10.0-windows\FanControl.MinisforumUM780XTX.dll"
+          if (-not (Test-Path -LiteralPath $plugin)) {
+              throw "Built plugin DLL was not found: $plugin"
+          }
+
+          $versionCore = ($env:PLUGIN_VERSION -split '-', 2)[0]
+          $expectedBinaryVersion = "$versionCore.0"
+          $assemblyVersion =
+              [Reflection.AssemblyName]::GetAssemblyName($plugin).Version.ToString()
+          $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($plugin)
+
+          if ($assemblyVersion -ne $expectedBinaryVersion) {
+              throw "Assembly version is $assemblyVersion; expected $expectedBinaryVersion."
+          }
+          if ($versionInfo.FileVersion -ne $expectedBinaryVersion) {
+              throw "File version is $($versionInfo.FileVersion); expected $expectedBinaryVersion."
+          }
+          if ($versionInfo.ProductVersion -ne $env:PLUGIN_VERSION) {
+              throw "Product version is $($versionInfo.ProductVersion); expected $env:PLUGIN_VERSION."
+          }
+
+          Write-Host "Verified plugin version $env:PLUGIN_VERSION."
 
       - name: Package plugin
         shell: pwsh
@@ -140,3 +216,45 @@ jobs:
           name: FanControl.MinisforumUM780XTX
           path: release-assets/FanControl.MinisforumUM780XTX.zip
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'workflow_dispatch' && needs.build.outputs.publish_release == 'true'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download plugin ZIP
+        uses: actions/download-artifact@v8
+        with:
+          name: FanControl.MinisforumUM780XTX
+          path: release-assets
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TARGET: ${{ github.sha }}
+          RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+        run: |
+          $releaseZip = (Get-Item -LiteralPath `
+              .\release-assets\FanControl.MinisforumUM780XTX.zip).FullName
+          $releaseTag = "v$env:RELEASE_VERSION"
+          $escapedTag = [Uri]::EscapeDataString($releaseTag)
+          $tagCheck = & gh api `
+              "repos/$env:GH_REPO/git/ref/tags/$escapedTag" `
+              --silent 2>&1
+          if ($LASTEXITCODE -eq 0) {
+              throw "Tag $releaseTag already exists. Choose a new version."
+          }
+          if (($tagCheck | Out-String) -notmatch '404') {
+              throw "Could not verify that tag $releaseTag is unused: $tagCheck"
+          }
+
+          gh release create $releaseTag $releaseZip `
+              --target $env:RELEASE_TARGET `
+              --title $releaseTag `
+              --generate-notes
