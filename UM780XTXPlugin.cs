@@ -1,4 +1,5 @@
 using FanControl.Plugins;
+using System.Runtime.ExceptionServices;
 
 namespace FanControl.MinisforumUM780XTX;
 
@@ -53,16 +54,30 @@ public sealed class UM780XTXPlugin : IPlugin2
             }
 
             PawnIoF7bsdBackend candidate = new();
+            backend = candidate;
             try
             {
-                candidate.Initialize();
+                F7bsdStartupRecovery recovery = candidate.Initialize();
                 Apply(candidate.ReadTelemetry());
-                backend = candidate;
-                Log("Minisforum UM780 XTX initialized.");
+                Log(StartupMessage(recovery));
             }
-            catch
+            catch (Exception failure)
             {
-                candidate.Dispose();
+                ClearTelemetry();
+                try
+                {
+                    candidate.Dispose();
+                    backend = null;
+                }
+                catch (Exception cleanup)
+                {
+                    throw new AggregateException(
+                        "UM780 XTX initialization failed and verified recovery " +
+                        "remains pending.",
+                        failure,
+                        cleanup);
+                }
+                ExceptionDispatchInfo.Capture(failure).Throw();
                 throw;
             }
         }
@@ -180,6 +195,31 @@ public sealed class UM780XTXPlugin : IPlugin2
         catch
         {
         }
+    }
+
+    private static string StartupMessage(F7bsdStartupRecovery recovery)
+    {
+        string profile = recovery.CpuSelector switch
+        {
+            0x00 => "Default",
+            0xb1 => "Balance",
+            0xb2 => "Performance",
+            _ => $"0x{recovery.CpuSelector:X2}",
+        };
+        List<string> recovered = [];
+        if (recovery.SystemRecovered)
+        {
+            recovered.Add(
+                $"system target {recovery.PreviousSystemTarget} released");
+        }
+        if (recovery.CpuRecovered)
+        {
+            recovered.Add("CPU table restored");
+        }
+        string detail = recovered.Count == 0
+            ? "no startup recovery needed"
+            : "startup recovery: " + string.Join(", ", recovered);
+        return $"Minisforum UM780 XTX initialized ({profile}; {detail}).";
     }
 
     private sealed class Sensor(string id, string name) : IPluginSensor

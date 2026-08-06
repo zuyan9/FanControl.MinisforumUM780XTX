@@ -83,9 +83,19 @@ internal sealed class PawnIoTransport : IDisposable
 
     internal void WriteCpuVerified(EcWrite[] writes, ReadOnlySpan<byte> baseline)
     {
+        WriteCpuVerified([], writes, baseline);
+    }
+
+    internal void WriteCpuVerified(
+        EcExpectation[] before,
+        EcWrite[] writes,
+        ReadOnlySpan<byte> baseline)
+    {
+        ArgumentNullException.ThrowIfNull(before);
         ArgumentNullException.ThrowIfNull(writes);
+        F7bsdProfile.AssertReadsAllowed(before.Select(item => item.Address));
         F7bsdProfile.AssertCpuWritesAllowed(writes, baseline);
-        WriteVerifiedCore([], writes, null);
+        WriteVerifiedCore(before, writes, null);
     }
 
     internal void WriteVerified(
