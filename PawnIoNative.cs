@@ -13,9 +13,7 @@ internal sealed class PawnIoTransport : IDisposable
     private static readonly TimeSpan IsaTimeout = TimeSpan.FromSeconds(1);
     private readonly Mutex isaMutex;
     private readonly PawnIoNative native;
-    private bool poisoned;
     private bool disposed;
-    private bool identityVerified;
     private Exception? poisonCause;
 
     internal PawnIoTransport()
@@ -32,16 +30,18 @@ internal sealed class PawnIoTransport : IDisposable
             candidate.OpenAndLoad(LoadLpcModule());
             isaMutex = mutex;
             native = candidate;
+            AssertIdentity();
         }
-        catch
+        catch (Exception exception)
         {
-            candidate?.Dispose();
-            mutex.Dispose();
-            throw;
+            Exception? failure = exception;
+            failure = CaptureFailure(failure, () => candidate?.Dispose());
+            failure = CaptureFailure(failure, mutex.Dispose);
+            ExceptionDispatchInfo.Capture(failure!).Throw();
         }
     }
 
-    internal void AssertIdentity()
+    private void AssertIdentity()
     {
         F7bsdProfile.AssertReadsAllowed(F7bsdProfile.ControllerProfileAddresses);
         RunIsa(() =>
@@ -66,14 +66,12 @@ internal sealed class PawnIoTransport : IDisposable
             }
             return 0;
         });
-        identityVerified = true;
     }
 
     internal byte[] Read(ushort[] addresses)
     {
         ArgumentNullException.ThrowIfNull(addresses);
         F7bsdProfile.AssertReadsAllowed(addresses);
-        EnsureIdentityVerified();
         return RunIsa(() =>
         {
             SelectSlot();
@@ -87,7 +85,6 @@ internal sealed class PawnIoTransport : IDisposable
     {
         ArgumentNullException.ThrowIfNull(writes);
         F7bsdProfile.AssertCpuWritesAllowed(writes, baseline);
-        EnsureIdentityVerified();
         WriteVerifiedCore([], writes, null);
     }
 
@@ -100,7 +97,6 @@ internal sealed class PawnIoTransport : IDisposable
         ArgumentNullException.ThrowIfNull(writes);
         F7bsdProfile.AssertReadsAllowed(before.Select(item => item.Address));
         F7bsdProfile.AssertWritesAllowed(writes);
-        EnsureIdentityVerified();
         WriteVerifiedCore(before, writes, beforeWrites);
     }
 
@@ -145,14 +141,10 @@ internal sealed class PawnIoTransport : IDisposable
             return;
         }
         disposed = true;
-        try
-        {
-            native.Dispose();
-        }
-        finally
-        {
-            isaMutex.Dispose();
-        }
+        Exception? failure = CaptureFailure(null, native.Dispose);
+        failure = CaptureFailure(failure, isaMutex.Dispose);
+        if (failure is not null)
+            ExceptionDispatchInfo.Capture(failure).Throw();
     }
 
     private T RunIsa<T>(Func<T> action)
@@ -171,19 +163,16 @@ internal sealed class PawnIoTransport : IDisposable
             {
                 held = true;
                 Poison(exception);
-                failure = AmbiguousState(
+                throw AmbiguousState(
                     "The ISA mutex was abandoned.",
                     exception);
             }
 
-            if (failure is null && !held)
+            if (!held)
             {
                 throw new TimeoutException("Timed out acquiring the ISA mutex.");
             }
-            if (failure is null)
-            {
-                result = action();
-            }
+            result = action();
         }
         catch (Exception exception)
         {
@@ -193,24 +182,23 @@ internal sealed class PawnIoTransport : IDisposable
         {
             if (held)
             {
-                try
+                Exception? releaseFailure = CaptureFailure(
+                    null,
+                    isaMutex.ReleaseMutex);
+                if (releaseFailure is not null)
                 {
-                    isaMutex.ReleaseMutex();
-                }
-                catch (Exception exception)
-                {
-                    Poison(exception);
+                    Poison(releaseFailure);
                     failure = Combine(
                         failure,
-                        AmbiguousState("Releasing the ISA mutex failed.", exception));
+                        AmbiguousState(
+                            "Releasing the ISA mutex failed.",
+                            releaseFailure));
                 }
             }
         }
 
         if (failure is not null)
-        {
             ExceptionDispatchInfo.Capture(failure).Throw();
-        }
         return result;
     }
 
@@ -255,27 +243,10 @@ internal sealed class PawnIoTransport : IDisposable
 
     private void Park()
     {
-        Exception? failure = null;
-        try
-        {
-            Out(0x2e, 0x10);
-        }
-        catch (Exception exception)
-        {
-            failure = exception;
-        }
-        try
-        {
-            ParkPnp();
-        }
-        catch (Exception exception)
-        {
-            failure = Combine(failure, exception);
-        }
+        Exception? failure = CaptureFailure(null, () => Out(0x2e, 0x10));
+        failure = CaptureFailure(failure, ParkPnp);
         if (failure is not null)
-        {
             ExceptionDispatchInfo.Capture(failure).Throw();
-        }
     }
 
     private void ParkPnp() => Execute("ioctl_pio_outb", [0x2e, 0x20], 0);
@@ -301,11 +272,8 @@ internal sealed class PawnIoTransport : IDisposable
             bodyFailure = exception;
         }
 
-        try
-        {
-            park();
-        }
-        catch (Exception parkFailure)
+        Exception? parkFailure = CaptureFailure(null, park);
+        if (parkFailure is not null)
         {
             Exception combined = Combine(bodyFailure, parkFailure);
             Poison(combined);
@@ -315,16 +283,14 @@ internal sealed class PawnIoTransport : IDisposable
         }
 
         if (bodyFailure is not null)
-        {
             ExceptionDispatchInfo.Capture(bodyFailure).Throw();
-        }
         return result;
     }
 
     private void EnsureUsable()
     {
         ObjectDisposedException.ThrowIf(disposed, this);
-        if (poisoned)
+        if (poisonCause is not null)
         {
             throw AmbiguousState(
                 "PawnIO transport was poisoned by an earlier selector failure.",
@@ -332,23 +298,7 @@ internal sealed class PawnIoTransport : IDisposable
         }
     }
 
-    private void EnsureIdentityVerified()
-    {
-        if (!identityVerified)
-        {
-            throw new InvalidOperationException(
-                "The UM780 XTX controller identity has not been verified.");
-        }
-    }
-
-    private void Poison(Exception exception)
-    {
-        if (!poisoned)
-        {
-            poisoned = true;
-            poisonCause = exception;
-        }
-    }
+    private void Poison(Exception exception) => poisonCause ??= exception;
 
     private static InvalidOperationException AmbiguousState(
         string detail,
@@ -359,6 +309,19 @@ internal sealed class PawnIoTransport : IDisposable
 
     private static Exception Combine(Exception? first, Exception second) =>
         first is null ? second : new AggregateException(first, second);
+
+    private static Exception? CaptureFailure(Exception? failure, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            return Combine(failure, exception);
+        }
+        return failure;
+    }
 
     private static byte[] LoadLpcModule()
     {
@@ -488,33 +451,25 @@ internal sealed class PawnIoNative : IDisposable
     public void Dispose()
     {
         Exception? failure = null;
-        if (handle != IntPtr.Zero)
+        Attempt(handle != IntPtr.Zero, () => Check(close(handle), "pawnio_close"));
+        handle = IntPtr.Zero;
+        Attempt(library != IntPtr.Zero, () => NativeLibrary.Free(library));
+        library = IntPtr.Zero;
+        if (failure is not null)
+            ExceptionDispatchInfo.Capture(failure).Throw();
+
+        void Attempt(bool needed, Action action)
         {
+            if (!needed)
+                return;
             try
             {
-                Check(close(handle), "pawnio_close");
-            }
-            catch (Exception exception)
-            {
-                failure = exception;
-            }
-            handle = IntPtr.Zero;
-        }
-        if (library != IntPtr.Zero)
-        {
-            try
-            {
-                NativeLibrary.Free(library);
+                action();
             }
             catch (Exception exception)
             {
                 failure = Combine(failure, exception);
             }
-            library = IntPtr.Zero;
-        }
-        if (failure is not null)
-        {
-            ExceptionDispatchInfo.Capture(failure).Throw();
         }
     }
 
