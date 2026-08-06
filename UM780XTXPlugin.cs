@@ -2,7 +2,6 @@ using FanControl.Plugins;
 
 namespace FanControl.MinisforumUM780XTX;
 
-/// <summary>Exposes raw UM780 XTX fan targets and EC telemetry.</summary>
 public sealed class UM780XTXPlugin : IPlugin2
 {
     private readonly object lifecycleSync = new();
@@ -17,13 +16,11 @@ public sealed class UM780XTXPlugin : IPlugin2
     private readonly ControlSensor systemControl;
     private PawnIoF7bsdBackend? backend;
 
-    /// <summary>Creates the plugin.</summary>
     public UM780XTXPlugin()
         : this(null)
     {
     }
 
-    /// <summary>Creates the plugin with Fan Control logging.</summary>
     public UM780XTXPlugin(IPluginLogger? logger)
     {
         this.logger = logger;
@@ -31,20 +28,18 @@ public sealed class UM780XTXPlugin : IPlugin2
             "cpu-control",
             "CPU Fan Control",
             $"{Name}/{cpuFan.Id}",
-            value => Set(F7bsdFan.Cpu, value),
-            () => Reset(F7bsdFan.Cpu));
+            SetCpu,
+            ResetCpu);
         systemControl = new ControlSensor(
             "system-control",
             "System Fan Control",
             $"{Name}/{systemFan.Id}",
-            value => Set(F7bsdFan.System, value),
-            () => Reset(F7bsdFan.System));
+            SetSystem,
+            ResetSystem);
     }
 
-    /// <inheritdoc />
     public string Name => "Minisforum UM780 XTX";
 
-    /// <inheritdoc />
     public void Initialize()
     {
         lock (lifecycleSync)
@@ -73,7 +68,6 @@ public sealed class UM780XTXPlugin : IPlugin2
         }
     }
 
-    /// <inheritdoc />
     public void Load(IPluginSensorsContainer container)
     {
         container.FanSensors.AddRange([cpuFan, systemFan]);
@@ -81,7 +75,6 @@ public sealed class UM780XTXPlugin : IPlugin2
         container.ControlSensors.AddRange([cpuControl, systemControl]);
     }
 
-    /// <inheritdoc />
     public void Update()
     {
         lock (lifecycleSync)
@@ -101,52 +94,66 @@ public sealed class UM780XTXPlugin : IPlugin2
         }
     }
 
-    /// <inheritdoc />
     public void Close()
     {
         lock (lifecycleSync)
         {
-            if (backend is null)
+            if (backend is not null)
             {
-                cpuControl.Clear();
-                systemControl.Clear();
-                ClearTelemetry();
-                return;
+                try
+                {
+                    backend.Dispose();
+                    backend = null;
+                }
+                catch (Exception exception)
+                {
+                    Log($"UM780 XTX restoration remains pending: {exception.Message}");
+                    return;
+                }
             }
 
-            try
-            {
-                backend.Dispose();
-                backend = null;
-                cpuControl.Clear();
-                systemControl.Clear();
-                ClearTelemetry();
-            }
-            catch (Exception exception)
-            {
-                Log($"UM780 XTX restoration remains pending: {exception.Message}");
-            }
+            cpuControl.Clear();
+            systemControl.Clear();
+            ClearTelemetry();
         }
     }
 
-    private byte Set(F7bsdFan fan, float percentage)
+    private byte SetCpu(float percentage) => Set(
+        percentage,
+        static (active, code) => active.SetCpu(code));
+
+    private byte SetSystem(float percentage) => Set(
+        percentage,
+        static (active, code) => active.SetSystem(code));
+
+    private byte Set(
+        float percentage,
+        Func<PawnIoF7bsdBackend, byte, byte> set)
     {
         lock (lifecycleSync)
         {
             byte code = F7bsdProfile.ToCode(percentage);
-            return (backend ??
-                throw new InvalidOperationException("The F7BSD backend is unavailable."))
-                .Set(fan, code);
+            return set(ActiveBackend(), code);
         }
     }
 
-    private void Reset(F7bsdFan fan)
+    private void ResetCpu() => Reset(static active => active.ResetCpu());
+
+    private void ResetSystem() => Reset(static active => active.ResetSystem());
+
+    private void Reset(Action<PawnIoF7bsdBackend> reset)
     {
         lock (lifecycleSync)
         {
-            backend?.Reset(fan);
+            if (backend is not null)
+            {
+                reset(backend);
+            }
         }
     }
+
+    private PawnIoF7bsdBackend ActiveBackend() => backend ??
+        throw new InvalidOperationException("The F7BSD backend is unavailable.");
 
     private void Apply(F7bsdTelemetry telemetry)
     {
@@ -183,9 +190,7 @@ public sealed class UM780XTXPlugin : IPlugin2
 
         public float? Value { get; internal set; }
 
-        public void Update()
-        {
-        }
+        public void Update() { }
     }
 
     private sealed class ControlSensor(
@@ -214,9 +219,7 @@ public sealed class UM780XTXPlugin : IPlugin2
             Value = null;
         }
 
-        public void Update()
-        {
-        }
+        public void Update() { }
 
         internal void Clear() => Value = null;
     }

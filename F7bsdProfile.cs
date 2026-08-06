@@ -1,11 +1,5 @@
 namespace FanControl.MinisforumUM780XTX;
 
-internal enum F7bsdFan
-{
-    Cpu,
-    System,
-}
-
 internal static class F7bsdProfile
 {
     internal const string Product = "Venus series";
@@ -73,15 +67,9 @@ internal static class F7bsdProfile
     [
         .. ControllerProfileAddresses,
         .. TelemetryAddresses,
-        .. CpuTachAddresses,
-        .. SystemTachAddresses,
         .. CpuSnapshotAddresses,
         .. SystemStateAddresses,
     ];
-    private static readonly HashSet<ushort> CpuBases = [.. CpuBaseAddresses];
-    private static readonly Dictionary<ushort, int> CpuSlopes = CpuSlopeAddresses
-        .Select((address, index) => new KeyValuePair<ushort, int>(address, index))
-        .ToDictionary();
 
     internal static byte ToCode(float percentage)
     {
@@ -229,11 +217,13 @@ internal static class F7bsdProfile
         ValidateCapturedCpuBaseline(baseline);
         foreach (EcWrite write in writes)
         {
+            int slopeIndex = Array.IndexOf(CpuSlopeAddresses, write.Address);
             bool allowed =
-                (CpuBases.Contains(write.Address) && write.Value <= MaximumCode) ||
-                (CpuSlopes.TryGetValue(write.Address, out int index) &&
+                (Array.IndexOf(CpuBaseAddresses, write.Address) >= 0 &&
+                    write.Value <= MaximumCode) ||
+                (slopeIndex >= 0 &&
                     (write.Value == 0 ||
-                        write.Value == baseline[CpuBaseAddresses.Length + index]));
+                        write.Value == baseline[CpuBaseAddresses.Length + slopeIndex]));
             if (!allowed)
             {
                 throw new InvalidOperationException(
