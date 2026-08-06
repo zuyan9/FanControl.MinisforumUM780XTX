@@ -16,7 +16,7 @@ The plugin loads only on the tested hardware profile:
 - BIOS `1.06`, EC `0.8`;
 - IT5571 PNP identity `55 71 02`;
 - controller profile `55 71 02 43 14 7f`; and
-- inactive firmware overrides and CPU critical row `(51,100,93,0)`.
+- a recognized BIOS CPU fan table and critical row `(51,100,93,0)`.
 
 It targets Windows x64, .NET 10, Fan Control V272, and PawnIO API 2.0.
 
@@ -37,9 +37,8 @@ or rate limits. Fan Control owns that policy.
 
 CPU control sets the same target in all seven normal temperature rows. The
 plugin never changes the independent critical row, so firmware still requests
-full speed at 94 C and above. The plugin does not interpret the BIOS fan-profile
-selector; it captures and restores the active table, so both Balance and
-Performance modes are supported.
+full speed at 94 C and above. It recognizes the BIOS-selected Default, Balance,
+or Performance table and restores that exact table when raw control ends.
 
 System control uses the firmware's `0xff` fixed-target handoff. While that
 handoff is active, firmware has no automatic system-temperature fallback. On
@@ -81,12 +80,17 @@ release, run the **Build and release** workflow from `master` and enter an
 unused `X.Y.Z` version. It verifies the binary version, uploads the plugin ZIP,
 and creates the matching `vX.Y.Z` GitHub release.
 
-## Recovery limitation
+## Recovery
 
 Disabling a control, refreshing the plugin, or exiting Fan Control normally
-restores the captured CPU table and returns the system fan to firmware.
+restores the selected BIOS CPU table and returns the system fan to firmware.
+
 Force-terminating Fan Control, suspending or crashing Windows, or a complete
-machine freeze can prevent cleanup and leave a raw target in volatile EC RAM.
-After any uncontrolled termination, reboot the machine before reopening Fan
-Control or using another EC utility. Restarting or refreshing Fan Control alone
-does not reload the BIOS-selected fan table.
+machine freeze can prevent that cleanup. On its next load, the plugin repairs an
+exact leftover raw state or interrupted restoration sequence before exposing its
+controls. This is a one-time handoff, not a background fan policy.
+
+The CPU controller has no ownership marker, so automatic recovery relies on the
+requirement that no other EC-writing utility runs concurrently. If the table or
+override state is not an exact state this plugin can produce, it refuses to write;
+fully power off the machine before accessing the controller again.
